@@ -79,6 +79,7 @@ SDK を使っている場所：
     ├── 0003_places_and_direction_unification.sql
     ├── 0004_timetable_cache.sql
     ├── 0005_add_gtfs_bus_tables.sql
+    ├── 0006_add_train_timetable_tables.sql
     └── meta/_journal.json
 ```
 
@@ -112,14 +113,14 @@ SDK も DB も Muse のランタイムが用意するため、この方法が一
 4. **`ctx.*` の差し替え**：§7 の対応表の通り、運行情報の Web 検索と推論（LLM）を自前の API に置き換える。
 5. **動作確認**：経路の登録／選択、徒歩実績の記録（学習への反映）、運行情報の更新（遅延の反映）、GPS 補正（ブラウザの位置情報許可が必要）まで一通り確認する。
 
-アクション一覧（`server/src/actions.ts`）：`getState`、`saveRoute`、`deleteRoute`、`setActiveRoute`、`recordWalk`、`deleteWalkLog`、`setManualDelay`、`refreshLineStatus`、`setDirection`、`clearDirection`、`searchPlaces`、`getLineStations`、`getStationLines`、`fetchTimetable`、`searchBusFeeds`、`getBusFeedRoutes`、`getBusRouteStops` の 17 つ。
+アクション一覧（`server/src/actions.ts`）：`getState`、`saveRoute`、`deleteRoute`、`setActiveRoute`、`recordWalk`、`deleteWalkLog`、`setManualDelay`、`refreshLineStatus`、`setDirection`、`clearDirection`、`searchPlaces`、`getLineStations`、`getStationLines`、`fetchTimetable`、`searchBusFeeds`、`getBusFeedRoutes`、`getBusRouteStops`、`fetchTrainTimetable`、`fetchTrainDetails` の 19 つ。
 
 ---
 
 ## 5. DB（`app.db`）について
 
 - 実データの入った `app.db` は**意図的にリポジトリへ上げていません**（利用者が登録した経路・徒歩実績というユーザーデータのため、`.gitignore` 対象）。
-- スキーマ定義は `server/src/schema.ts`、マイグレーションは `drizzle/` にあります。テーブルは次の 9 つです。
+- スキーマ定義は `server/src/schema.ts`、マイグレーションは `drizzle/` にあります。テーブルは次の 11 つです。
   - `routes`（登録経路：名前、安全余裕の分数など）
   - `segments`（経路の区間列：徒歩／乗車、駅・路線、発車時刻リスト、緯度経度など。`0003` で地点名・住所、到着側の地点名・住所・緯度経度、帰り方向の発車時刻リストが追加された）
   - `walk_logs`（徒歩実績：予定と実績。学習に使う）
@@ -127,13 +128,16 @@ SDK も DB も Muse のランタイムが用意するため、この方法が一
   - `app_settings`（アプリ設定：選択中の経路など。`0003` で現在の移動方向とその判定元が追加された）
   - `timetable_cache`（自動取得した時刻表のキャッシュ：路線・乗車駅・方面ごとに平日／土休日の発車時刻リストと出典 URL を保持。`0004` で追加された）
   - `gtfs_feed_cache`／`gtfs_line_cache`／`gtfs_departures`（バスの GTFS フィードのキャッシュ：事業者の路線一覧、路線・方向ごとの停留所列、バス停ごとの平日／土休日の発車時刻。`0005` で追加された）
-- 再作成手順：空の SQLite ファイルを用意し、**`0001_initial.sql` → `0002_transit_tables_replace_entries.sql` → `0003_places_and_direction_unification.sql` → `0004_timetable_cache.sql` → `0005_add_gtfs_bus_tables.sql` の順に 5 つすべて**を適用してください。
+  - `train_timetable_cache`／`train_detail_cache`（列車単位データのキャッシュ：種別付きの発車列車一覧と、列車ごとの停車駅・各駅時刻。特急を含む乗り換え選択に使う。`0006` で追加された）
+- 再作成手順：空の SQLite ファイルを用意し、**`0001_initial.sql` → `0002_transit_tables_replace_entries.sql` → `0003_places_and_direction_unification.sql` → `0004_timetable_cache.sql` → `0005_add_gtfs_bus_tables.sql` → `0006_add_train_timetable_tables.sql` の順に 6 つすべて**を適用してください。
   - 注意：`0001` は旧形式の `entries` テーブルを作るだけの初期マイグレーションで、`0002` がそれを削除して上記 5 テーブルを作ります。`0003` はテーブルは増やさず、`segments` と `app_settings` へ列を追加するマイグレーションです（`segments`：`place_name`、`place_address`、`to_place_name`、`to_place_address`、`to_lat`、`to_lng`、`departures_return`／`app_settings`：`direction`、`direction_source`）。
   - 現在のコードは `0003` の列を前提にしているため、**`0003` を飛ばすと地点情報や移動方向の保存でエラーになります**。以前の手順（`0001`→`0002`）で作成済みの DB がある場合は、作り直さず `0003` だけを追加で適用してください。
   - `0004` は `timetable_cache` テーブル（と一意インデックス）を追加するだけのマイグレーションです。`0003` まで適用済みの DB がある場合は、作り直さず `0004` だけを追加で適用してください。飛ばすと時刻表の自動取得結果をキャッシュできず、案内が成立しません。
   - `0005` は GTFS 用の 3 テーブル（`gtfs_feed_cache`、`gtfs_line_cache`、`gtfs_departures`）を追加するだけのマイグレーションです。`0004` まで適用済みの DB がある場合は、作り直さず `0005` だけを追加で適用してください。飛ばすとバスの路線図・時刻表のキャッシュが保存できません。
+  - `0006` は列車単位データ用の 2 テーブル（`train_timetable_cache`、`train_detail_cache`）を追加するだけのマイグレーションです。`0005` まで適用済みの DB がある場合は、作り直さず `0006` だけを追加で適用してください。飛ばすと特急を含む乗り換え選択のための列車データがキャッシュできません。
 - DB の中身は空からで問題ありません（本番スペースも空の状態で出荷されています）。ダイヤ（発車時刻）は経路登録時にユーザーが入力するものではなく、発車案内を開いたときに路線・乗車駅・方面から自動取得されます（下記）。そのため外部ダイヤデータは同梱されていません。
 - 時刻表の自動取得（`fetchTimetable`）：主経路は駅探（ekitan.com）の駅時刻表ページを直接取得し、決定的に解析します（平日分は火曜日のダイヤ、土休日分は土曜日のダイヤとして読み取ります）。取得結果は出典 URL 付きで `timetable_cache` にキャッシュされます。駅探で取得できない場合は、Web 検索で見つけた時刻表ページを `ctx.inference` で抽出する経路にフォールバックします。取得に失敗した場合は捏造せず、理由を表示して再試行できます。降車駅の選択は、鉄道では路線の駅一覧（路線図）から方向別に選ぶ方式です（`getLineStations`／`getStationLines`）。
+- 列車単位データと乗り換え選択（`fetchTrainTimetable`／`fetchTrainDetails`）：駅探の方向ページと列車別ページから、列車ごとの種別（普通・快速・特急など）・行き先・停車駅と各駅の到着／発車時刻を取得して `train_*_cache` にキャッシュします。案内ボードでは、出発タブ（今から乗れる電車と「1本／2本遅らせる」）と、途中駅での「○○で乗り換える／乗り換えない（直通）」タブを切り替えると、その先の全区間の乗車便・待ち時間・最終到着が再計算されます。現状の制約：乗り換えタブは最初の乗車区間のみ（下流区間は実到着時刻で自動計算）、途中駅は最大6駅・候補3本まで、バス（GTFS）区間は対象外です。
 - バスの路線図と時刻表（GTFS）：バスは GTFS データリポジトリ（api.gtfs-data.jp/v2、キー不要）の公開フィードを使います。乗車バス停の近くの収録フィードを自動提示し（事業者名検索も可：`searchBusFeeds`）、フィード→路線（`getBusFeedRoutes`）→方向→運行順の停留所列（`getBusRouteStops`）から降車バス停を選びます。フィードの ZIP を初回だけ取得・解析し、`gtfs_*` テーブルに 7 日間キャッシュします。ライセンス（CC BY 等）の帰属表示として、出典に事業者名と GTFS データリポジトリを表示します。**制約**：同リポジトリに京都府のフィードは収録されておらず、京都市バス・京阪バス・阪急バスは対象外です（京都市バスの GTFS は ODPT 経由のみで、ODPT は無料のアクセストークンが必須のため未連携）。対象外のバス路線では降車バス停を従来の地点検索で登録します。GTFS-RT（リアルタイム遅延）も未取り込みです。
 
 ---
