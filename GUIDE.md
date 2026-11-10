@@ -76,6 +76,7 @@ SDK を使っている場所：
 └── drizzle/              # SQLite マイグレーション
     ├── 0001_initial.sql
     ├── 0002_transit_tables_replace_entries.sql
+    ├── 0003_places_and_direction_unification.sql
     └── meta/_journal.json
 ```
 
@@ -118,12 +119,13 @@ SDK も DB も Muse のランタイムが用意するため、この方法が一
 - 実データの入った `app.db` は**意図的にリポジトリへ上げていません**（利用者が登録した経路・徒歩実績というユーザーデータのため、`.gitignore` 対象）。
 - スキーマ定義は `server/src/schema.ts`、マイグレーションは `drizzle/` にあります。テーブルは次の 5 つです。
   - `routes`（登録経路：名前、安全余裕の分数など）
-  - `segments`（経路の区間列：徒歩／乗車、駅・路線、発車時刻リスト、緯度経度など）
+  - `segments`（経路の区間列：徒歩／乗車、駅・路線、発車時刻リスト、緯度経度など。`0003` で地点名・住所、到着側の地点名・住所・緯度経度、帰り方向の発車時刻リストが追加された）
   - `walk_logs`（徒歩実績：予定と実績。学習に使う）
   - `line_status`（路線ごとの運行情報キャッシュ：状態、遅延分数、手動上書き、取得元 URL など）
-  - `app_settings`（アプリ設定：選択中の経路など）
-- 再作成手順：空の SQLite ファイルを用意し、**`0001_initial.sql` → `0002_transit_tables_replace_entries.sql` の順に両方**を適用してください。
-  - 注意：`0001` は旧形式の `entries` テーブルを作るだけの初期マイグレーションで、`0002` がそれを削除して上記 5 テーブルを作ります。`0002` だけを適用しても動きますが、履歴（`drizzle/meta/_journal.json`）と揃えるなら両方を順に適用するのが正規手順です。
+  - `app_settings`（アプリ設定：選択中の経路など。`0003` で現在の移動方向とその判定元が追加された）
+- 再作成手順：空の SQLite ファイルを用意し、**`0001_initial.sql` → `0002_transit_tables_replace_entries.sql` → `0003_places_and_direction_unification.sql` の順に 3 つすべて**を適用してください。
+  - 注意：`0001` は旧形式の `entries` テーブルを作るだけの初期マイグレーションで、`0002` がそれを削除して上記 5 テーブルを作ります。`0003` はテーブルは増やさず、`segments` と `app_settings` へ列を追加するマイグレーションです（`segments`：`place_name`、`place_address`、`to_place_name`、`to_place_address`、`to_lat`、`to_lng`、`departures_return`／`app_settings`：`direction`、`direction_source`）。
+  - 現在のコードは `0003` の列を前提にしているため、**`0003` を飛ばすと地点情報や移動方向の保存でエラーになります**。以前の手順（`0001`→`0002`）で作成済みの DB がある場合は、作り直さず `0003` だけを追加で適用してください。
 - DB の中身は空からで問題ありません（本番スペースも空の状態で出荷されています）。ダイヤ（発車時刻）も経路登録時にユーザーが入力する設計で、外部ダイヤデータは同梱されていません。
 
 ---
