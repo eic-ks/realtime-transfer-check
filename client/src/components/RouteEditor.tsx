@@ -11,6 +11,15 @@
 // (reordering or removing a segment re-links the chain). Because the
 // start is always chained in, segments after the first show their start
 // spot as a read-only display — no second place picker to fill in.
+//
+// The list is drawn as a vertical timeline (a rail with a dot per
+// segment). Between every pair of segments — and before the start —
+// sits an insert strip: tapping it drops a new walk/ride segment in at
+// exactly that position, so adding a spot mid-route no longer means
+// "append at the end, then tap ↑ repeatedly". The strip before the
+// start PREPENDS: a new origin plus a connecting segment to the old
+// start, which is how the start moves one spot earlier without losing
+// the old start spot.
 
 import { useState, type ReactNode } from "react";
 import {
@@ -371,6 +380,99 @@ function ChainedStart({
   );
 }
 
+// Insert strip on the timeline rail, rendered between two segment cards
+// (or before the start). Tapping the ＋ expands a two-way choice — 徒歩 /
+// 電車 — and the picked segment is inserted at exactly this position;
+// the chain re-links around it, so the following segment now starts at
+// the new spot once the user registers it.
+function InsertStrip({
+  label,
+  verb,
+  open,
+  onToggle,
+  onPick,
+}: {
+  label: string;
+  /** "入れる" between segments, "つなぐ" before the start. */
+  verb: "入れる" | "つなぐ";
+  open: boolean;
+  onToggle: () => void;
+  onPick: (type: "walk" | "ride") => void;
+}) {
+  if (!open) {
+    return (
+      <div className="relative py-1">
+        <button
+          type="button"
+          aria-label={label}
+          aria-expanded={false}
+          onClick={onToggle}
+          className="flex items-center gap-2"
+        >
+          <span className="flex w-8 shrink-0 items-center justify-center">
+            <span className="relative z-10 flex h-6 w-6 items-center justify-center rounded-full border border-dashed border-[var(--accent-dim)] bg-[var(--surface)] text-[var(--accent)]">
+              <PlusIcon size={13} />
+            </span>
+          </span>
+          <span className="py-1 text-left text-xs font-bold text-[var(--dim)]">
+            {label}
+          </span>
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div className="relative flex items-center gap-2 py-1">
+      <span className="flex w-8 shrink-0 items-center justify-center">
+        <button
+          type="button"
+          aria-label={label}
+          aria-expanded={true}
+          onClick={onToggle}
+          className="relative z-10 flex h-6 w-6 items-center justify-center rounded-full border border-[var(--accent)] bg-[var(--surface)] text-[var(--accent)]"
+        >
+          <PlusIcon size={13} />
+        </button>
+      </span>
+      <span className="flex flex-wrap items-center gap-1.5">
+        <button
+          type="button"
+          className="flex items-center gap-1 rounded-full border border-[var(--accent-dim)] bg-[#123c26] px-2.5 py-1.5 text-xs font-black text-[#4ade80]"
+          onClick={() => onPick("walk")}
+        >
+          <WalkIcon size={13} /> 徒歩で{verb}
+        </button>
+        <button
+          type="button"
+          className="flex items-center gap-1 rounded-full border border-[var(--accent-dim)] bg-[#123c26] px-2.5 py-1.5 text-xs font-black text-[#4ade80]"
+          onClick={() => onPick("ride")}
+        >
+          <TrainIcon size={13} /> 電車で{verb}
+        </button>
+        <span className="text-xs text-[var(--dim)]">
+          {verb === "つなぐ"
+            ? "新しいスタート地点を選ぶ欄が先頭に追加されます"
+            : "ここに新しい地点をはさみます"}
+        </span>
+      </span>
+    </div>
+  );
+}
+
+// One-line summary shown in a segment card's header, so the whole route
+// reads as a chain of spots even before any card is examined in detail.
+function segmentSummary(d: DraftSegment): string {
+  const from = d.place.name || "（未定）";
+  const to = d.toPlace.name || "（未定）";
+  if (d.type === "origin") {
+    return d.place.address || "経路のスタート地点";
+  }
+  if (d.type === "walk") {
+    return `${from} → ${to}${d.baseWalkMin ? ` ・ 約${d.baseWalkMin}分` : ""}`;
+  }
+  return `${d.line ? `${d.line} ・ ` : ""}${from} → ${to}${d.rideMin ? ` ・ 乗車約${d.rideMin}分` : ""}`;
+}
+
 interface EditorProps {
   title: string;
   initialName: string;
@@ -396,6 +498,12 @@ export function RouteEditor({
   const [bufferMin, setBufferMin] = useState(String(initialBuffer));
   const [drafts, setDrafts] = useState<DraftSegment[]>(initialSegments);
   const [error, setError] = useState<string | null>(null);
+  // Which insert strip is expanded: -1 = before the start, i = after
+  // drafts[i], null = none.
+  const [insertAt, setInsertAt] = useState<number | null>(null);
+  // Key of the segment just inserted/prepended, ring-highlighted so the
+  // user sees where the new card landed.
+  const [highlightKey, setHighlightKey] = useState<number | null>(null);
 
   const update = (key: number, patch: Partial<DraftSegment>) => {
     setDrafts((prev) =>
@@ -418,8 +526,9 @@ export function RouteEditor({
     setDrafts((prev) => rechain(prev.filter((_, i) => i !== idx)));
   };
   const add = (type: "walk" | "ride") => {
+    const draft = newDraftSegment(type);
+    setHighlightKey(draft.key);
     setDrafts((prev) => {
-      const draft = newDraftSegment(type);
       const last = prev[prev.length - 1];
       if (last) {
         // The new segment starts where the previous one ended — the user
@@ -431,6 +540,54 @@ export function RouteEditor({
       }
       return [...prev, draft];
     });
+  };
+
+  // Insert a new segment right after drafts[idx] (mid-route spot
+  // insertion). The new segment starts at drafts[idx]'s end spot; the
+  // segment that used to follow now starts at the NEW segment's end
+  // spot, via rechain — so once the user registers the new spot, the
+  // rest of the route re-links behind it automatically.
+  const insertAfter = (idx: number, type: "walk" | "ride") => {
+    const draft = newDraftSegment(type);
+    setHighlightKey(draft.key);
+    setDrafts((prev) => {
+      const before = prev[idx];
+      if (before) {
+        const end = endPlaceOf(before);
+        draft.place = { ...end };
+        draft.fromLabel = end.name;
+        if (type === "ride" && end.line) draft.line = end.line;
+      }
+      const next = [
+        ...prev.slice(0, idx + 1),
+        draft,
+        ...prev.slice(idx + 1),
+      ];
+      return rechain(next);
+    });
+    setInsertAt(null);
+  };
+
+  // Move the start one spot earlier: a fresh origin (the user picks the
+  // new start spot in its picker) plus a connecting walk/ride segment
+  // whose destination is the old start spot. The old origin card goes
+  // away — its spot lives on as the connecting segment's end, and the
+  // rest of the chain re-links behind it unchanged.
+  const prepend = (type: "walk" | "ride") => {
+    const newOrigin = newDraftSegment("origin");
+    const seg = newDraftSegment(type);
+    setHighlightKey(newOrigin.key);
+    setDrafts((prev) => {
+      const oldOrigin = prev[0];
+      if (!oldOrigin) return prev;
+      seg.toPlace = { ...oldOrigin.place };
+      seg.toLabel = oldOrigin.place.name;
+      if (type === "ride" && oldOrigin.place.line) {
+        seg.line = oldOrigin.place.line;
+      }
+      return rechain([newOrigin, seg, ...prev.slice(1)]);
+    });
+    setInsertAt(null);
   };
 
   // Chain-aware place edits: changing a segment's start also rewrites the
@@ -542,172 +699,222 @@ export function RouteEditor({
         </Field>
       </div>
       <p className="mt-1 text-xs text-[var(--dim)]">
-        行き・帰りは分けず、1つの経路で登録します。どちらの方向かはアプリが現在地から自動で判定します。余裕は「ホームに着いてから発車まで」に確保する安全マージンです。
+        行き・帰りは分けず、1つの経路で登録します。どちらの方向かはアプリが現在地から自動で判定します。余裕は「ホームに着いてから発車まで」に確保する安全マージンです。途中に地点をはさみたいときは、区間の間にある「＋」からその場で追加できます。
       </p>
 
-      <div className="mt-4 space-y-3">
+      <div className="relative mt-3">
+        {/* Timeline rail behind the dots and insert buttons. */}
+        <div
+          aria-hidden
+          className="absolute bottom-4 left-[15px] top-4 w-[2px] rounded bg-[var(--border)]"
+        />
+        <InsertStrip
+          label="スタートの手前に地点を追加"
+          verb="つなぐ"
+          open={insertAt === -1}
+          onToggle={() => setInsertAt(insertAt === -1 ? null : -1)}
+          onPick={prepend}
+        />
         {drafts.map((d, idx) => (
-          <div
-            key={d.key}
-            className="rounded-lg border border-[var(--border)] bg-[var(--surface2)] p-3"
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="flex items-center gap-1.5 text-sm font-black">
-                {d.type === "origin" ? (
-                  <FlagIcon size={16} className="text-[var(--accent)]" />
-                ) : d.type === "walk" ? (
-                  <WalkIcon size={16} className="text-[var(--warn)]" />
-                ) : (
-                  <TrainIcon size={16} className="text-[var(--accent)]" />
-                )}
-                {idx + 1}.{" "}
-                {d.type === "origin"
-                  ? "出発地点"
-                  : d.type === "walk"
-                    ? "徒歩"
-                    : "電車"}
+          <div key={d.key}>
+            <div className="relative flex gap-2">
+              <span className="flex w-8 shrink-0 justify-center pt-3">
+                <span
+                  className={`relative z-10 flex h-8 w-8 items-center justify-center rounded-full border ${
+                    d.type === "origin"
+                      ? "border-[var(--accent)] bg-[var(--accent)] text-[#0b2013]"
+                      : "border-[var(--border)] bg-[var(--surface2)]"
+                  }`}
+                >
+                  {d.type === "origin" ? (
+                    <FlagIcon size={15} />
+                  ) : d.type === "walk" ? (
+                    <WalkIcon size={15} className="text-[var(--warn)]" />
+                  ) : (
+                    <TrainIcon size={15} className="text-[var(--accent)]" />
+                  )}
+                </span>
               </span>
-              <span className="flex items-center gap-1">
-                <button
-                  type="button"
-                  aria-label={`区間${idx + 1}を上へ`}
-                  className="rounded p-1.5 text-[var(--dim)] disabled:opacity-30"
-                  disabled={idx <= 1}
-                  onClick={() => move(idx, -1)}
-                >
-                  <ChevronUpIcon size={16} />
-                </button>
-                <button
-                  type="button"
-                  aria-label={`区間${idx + 1}を下へ`}
-                  className="rounded p-1.5 text-[var(--dim)] disabled:opacity-30"
-                  disabled={idx === 0 || idx === drafts.length - 1}
-                  onClick={() => move(idx, 1)}
-                >
-                  <ChevronDownIcon size={16} />
-                </button>
-                <button
-                  type="button"
-                  aria-label={`区間${idx + 1}を削除`}
-                  className="rounded p-1.5 text-[var(--danger)] disabled:opacity-30"
-                  disabled={idx === 0}
-                  onClick={() => remove(idx)}
-                >
-                  <TrashIcon size={16} />
-                </button>
-              </span>
-            </div>
-
-            {d.type === "origin" && (
-              <div className="mt-2">
-                <PlacePicker
-                  label="地点名"
-                  namePlaceholder="例: 自宅"
-                  value={d.place}
-                  onChange={(place) => setStartPlace(idx, place)}
-                />
-              </div>
-            )}
-
-            {d.type === "walk" && (
-              <div className="mt-2 space-y-3">
-                <ChainedStart label="出発地" value={d.place} />
-                <PlacePicker
-                  label="到着地"
-                  namePlaceholder="例: 最寄り駅"
-                  value={d.toPlace}
-                  onChange={(toPlace) => setEndPlace(idx, toPlace)}
-                  near={placeNear(d.place)}
-                />
-                <Field label="徒歩分数（目安）">
-                  <input
-                    aria-label="徒歩分数"
-                    className={inputCls}
-                    type="number"
-                    min={1}
-                    max={240}
-                    value={d.baseWalkMin}
-                    onChange={(e) =>
-                      update(d.key, { baseWalkMin: e.target.value })
-                    }
-                  />
-                </Field>
-                <p className="text-xs text-[var(--dim)]">
-                  徒歩分数は両方向で共通です。実際に歩いた記録がたまると、あなたのペースに合わせて自動で補正されます。
+              <div
+                className={`min-w-0 flex-1 rounded-lg border bg-[var(--surface2)] p-3 ${
+                  d.key === highlightKey
+                    ? "border-[var(--accent)] ring-2 ring-[var(--accent)]"
+                    : "border-[var(--border)]"
+                }`}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <span className="flex min-w-0 items-center gap-1.5 text-sm font-black">
+                    {idx + 1}.{" "}
+                    {d.type === "origin"
+                      ? "出発地点"
+                      : d.type === "walk"
+                        ? "徒歩"
+                        : "電車"}
+                    {d.key === highlightKey && (
+                      <span className="rounded bg-[#123c26] px-1.5 py-0.5 text-[11px] font-bold text-[#4ade80]">
+                        追加しました
+                      </span>
+                    )}
+                  </span>
+                  <span className="flex shrink-0 items-center gap-1">
+                    <button
+                      type="button"
+                      aria-label={`区間${idx + 1}を上へ`}
+                      className="rounded p-1.5 text-[var(--dim)] disabled:opacity-30"
+                      disabled={idx <= 1}
+                      onClick={() => move(idx, -1)}
+                    >
+                      <ChevronUpIcon size={16} />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`区間${idx + 1}を下へ`}
+                      className="rounded p-1.5 text-[var(--dim)] disabled:opacity-30"
+                      disabled={idx === 0 || idx === drafts.length - 1}
+                      onClick={() => move(idx, 1)}
+                    >
+                      <ChevronDownIcon size={16} />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`区間${idx + 1}を削除`}
+                      className="rounded p-1.5 text-[var(--danger)] disabled:opacity-30"
+                      disabled={idx === 0}
+                      onClick={() => remove(idx)}
+                    >
+                      <TrashIcon size={16} />
+                    </button>
+                  </span>
+                </div>
+                <p className="mt-1 text-xs text-[var(--dim)]">
+                  {segmentSummary(d)}
                 </p>
-              </div>
-            )}
 
-            {d.type === "ride" && (
-              <div className="mt-2 space-y-3">
-                <ChainedStart label="乗車駅" value={d.place} />
-                <LineStationPicker
-                  line={d.line}
-                  onLineChange={(line) => update(d.key, { line })}
-                  boarding={d.place}
-                  value={d.toPlace}
-                  onChange={(toPlace) => setEndPlace(idx, toPlace)}
-                  fallback={
+                {d.type === "origin" && (
+                  <div className="mt-2">
                     <PlacePicker
-                      label="降車駅・バス停"
-                      namePlaceholder="例: 池袋"
+                      label="地点名"
+                      namePlaceholder="例: 自宅"
+                      value={d.place}
+                      onChange={(place) => setStartPlace(idx, place)}
+                    />
+                  </div>
+                )}
+
+                {d.type === "walk" && (
+                  <div className="mt-2 space-y-3">
+                    <ChainedStart label="出発地" value={d.place} />
+                    <PlacePicker
+                      label="到着地"
+                      namePlaceholder="例: 最寄り駅"
                       value={d.toPlace}
                       onChange={(toPlace) => setEndPlace(idx, toPlace)}
                       near={placeNear(d.place)}
                     />
-                  }
-                />
-                <div className="grid grid-cols-2 gap-2">
-                  <Field label="乗車時間（分）">
-                    <input
-                      aria-label="乗車時間"
-                      className={inputCls}
-                      type="number"
-                      min={1}
-                      max={600}
-                      value={d.rideMin}
-                      onChange={(e) =>
-                        update(d.key, { rideMin: e.target.value })
+                    <Field label="徒歩分数（目安）">
+                      <input
+                        aria-label="徒歩分数"
+                        className={inputCls}
+                        type="number"
+                        min={1}
+                        max={240}
+                        value={d.baseWalkMin}
+                        onChange={(e) =>
+                          update(d.key, { baseWalkMin: e.target.value })
+                        }
+                      />
+                    </Field>
+                    <p className="text-xs text-[var(--dim)]">
+                      徒歩分数は両方向で共通です。実際に歩いた記録がたまると、あなたのペースに合わせて自動で補正されます。
+                    </p>
+                  </div>
+                )}
+
+                {d.type === "ride" && (
+                  <div className="mt-2 space-y-3">
+                    <ChainedStart label="乗車駅" value={d.place} />
+                    <LineStationPicker
+                      line={d.line}
+                      onLineChange={(line) => update(d.key, { line })}
+                      boarding={d.place}
+                      value={d.toPlace}
+                      onChange={(toPlace) => setEndPlace(idx, toPlace)}
+                      fallback={
+                        <PlacePicker
+                          label="降車駅・バス停"
+                          namePlaceholder="例: 池袋"
+                          value={d.toPlace}
+                          onChange={(toPlace) => setEndPlace(idx, toPlace)}
+                          near={placeNear(d.place)}
+                        />
                       }
                     />
-                  </Field>
-                  <Field label="乗換・入場（分）">
-                    <input
-                      aria-label="乗り換え入場分数"
-                      className={inputCls}
-                      type="number"
-                      min={0}
-                      max={60}
-                      value={d.accessMin}
-                      onChange={(e) =>
-                        update(d.key, { accessMin: e.target.value })
-                      }
-                    />
-                  </Field>
-                </div>
-                <p className="text-xs text-[var(--dim)]">
-                  発車時刻は登録不要です。発車案内を開いたときに、路線と乗車駅・降車駅から時刻表を自動で取得して使います。駅・路線・乗車時間は行き・帰り両方向で共通です。路線図から降車駅を選べるのは鉄道の路線と、GTFSデータリポジトリ（国土交通省）に収録されたバス路線です。収録されていないバス路線は、降車バス停を検索で登録してください（その場合、時刻表の自動取得は対象外です）。
-                </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      <Field label="乗車時間（分）">
+                        <input
+                          aria-label="乗車時間"
+                          className={inputCls}
+                          type="number"
+                          min={1}
+                          max={600}
+                          value={d.rideMin}
+                          onChange={(e) =>
+                            update(d.key, { rideMin: e.target.value })
+                          }
+                        />
+                      </Field>
+                      <Field label="乗換・入場（分）">
+                        <input
+                          aria-label="乗り換え入場分数"
+                          className={inputCls}
+                          type="number"
+                          min={0}
+                          max={60}
+                          value={d.accessMin}
+                          onChange={(e) =>
+                            update(d.key, { accessMin: e.target.value })
+                          }
+                        />
+                      </Field>
+                    </div>
+                    <p className="text-xs text-[var(--dim)]">
+                      発車時刻は登録不要です。発車案内を開いたときに、路線と乗車駅・降車駅から時刻表を自動で取得して使います。駅・路線・乗車時間は行き・帰り両方向で共通です。路線図から降車駅を選べるのは鉄道の路線と、GTFSデータリポジトリ（国土交通省）に収録されたバス路線です。収録されていないバス路線は、降車バス停を検索で登録してください（その場合、時刻表の自動取得は対象外です）。
+                    </p>
+                  </div>
+                )}
               </div>
+            </div>
+            {idx < drafts.length - 1 && (
+              <InsertStrip
+                label={
+                  idx === 0
+                    ? "出発地点の直後に地点を追加"
+                    : `区間${idx + 1}の後に地点を追加`
+                }
+                verb="入れる"
+                open={insertAt === idx}
+                onToggle={() => setInsertAt(insertAt === idx ? null : idx)}
+                onPick={(type) => insertAfter(idx, type)}
+              />
             )}
           </div>
         ))}
       </div>
 
-      <div className="mt-3 flex gap-2">
+      <div className="mt-2 flex gap-2 pl-10">
         <button
           type="button"
-          className="flex items-center gap-1 rounded-md border border-[var(--border)] px-3 py-2 text-sm font-bold"
+          className="flex items-center gap-1 rounded-md border border-dashed border-[var(--border)] px-3 py-2 text-sm font-bold"
           onClick={() => add("walk")}
         >
-          <PlusIcon size={15} /> 徒歩区間
+          <PlusIcon size={15} /> 徒歩区間を最後に追加
         </button>
         <button
           type="button"
-          className="flex items-center gap-1 rounded-md border border-[var(--border)] px-3 py-2 text-sm font-bold"
+          className="flex items-center gap-1 rounded-md border border-dashed border-[var(--border)] px-3 py-2 text-sm font-bold"
           onClick={() => add("ride")}
         >
-          <PlusIcon size={15} /> 電車区間
+          <PlusIcon size={15} /> 電車区間を最後に追加
         </button>
       </div>
 
