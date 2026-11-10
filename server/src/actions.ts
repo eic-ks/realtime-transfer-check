@@ -365,10 +365,78 @@ function bigramDice(a: string, b: string): number {
   return A.size + B.size === 0 ? 0 : (2 * hit) / (A.size + B.size);
 }
 
+function commonSuffixLen(a: string, b: string): number {
+  let n = 0;
+  while (
+    n < a.length &&
+    n < b.length &&
+    a[a.length - 1 - n] === b[b.length - 1 - n]
+  ) {
+    n++;
+  }
+  return n;
+}
+
+function commonPrefixLen(a: string, b: string): number {
+  let n = 0;
+  while (n < a.length && n < b.length && a[n] === b[n]) n++;
+  return n;
+}
+
 /** True when a fuzzy source result plausibly refers to the queried name. */
 function namePlausible(query: string, name: string): boolean {
   if (nameMatchScore(query, name) > 0) return true;
-  return bigramDice(coreName(query), coreName(name)) >= 0.34;
+  const q = coreName(query);
+  const n = coreName(name);
+  // Renamed-station shape: 阪急梅田 vs 大阪梅田 — the operator/city
+  // prefix differs but the distinctive tail (梅田) is shared, with at
+  // most a short prefix left over on each side. The bigram Dice for
+  // that pair is 0.333, just under the fuzzy threshold, which used to
+  // filter the real station out and leave only the same-named bus
+  // stop. A shared tail of ≥2 chars with ≤2 leftover chars per side
+  // is specific enough for tag-filtered station/bus-stop sources —
+  // but only when the heads differ entirely: 金閣寺前 vs 金昌寺前
+  // share the head 金 AND the tail 寺前 yet are different stops, so a
+  // common prefix disqualifies the pair.
+  const suffix = commonSuffixLen(q, n);
+  if (
+    suffix >= 2 &&
+    q.length - suffix <= 2 &&
+    n.length - suffix <= 2 &&
+    commonPrefixLen(q, n) === 0
+  ) {
+    return true;
+  }
+  return bigramDice(q, n) >= 0.34;
+}
+
+// Stations renamed in recent years are still widely known — and
+// searched — by their old operator-prefixed names, while every
+// station database (HeartRails, OSM) only carries the current
+// official name. Without this bridge, 「阪急梅田駅」 finds no station
+// at all (HeartRails answers "not found" for 阪急梅田; the station is
+// 大阪梅田 since the 2019 rename) and only the same-named bus stop
+// surfaces. Keys and values are name cores (駅 suffix stripped);
+// every entry was verified live against HeartRails (old name →
+// error or wrong region, current name → the intended station).
+const STATION_NAME_ALIASES: Record<string, string[]> = {
+  "阪急梅田": ["大阪梅田"],
+  "阪神梅田": ["大阪梅田"],
+  "近鉄難波": ["大阪難波"],
+  "阪神難波": ["大阪難波"],
+  "河原町": ["京都河原町"],
+  "三宮": ["神戸三宮"],
+};
+
+/** The name itself plus its current official name(s), as cores. */
+function stationNameVariants(name: string): string[] {
+  const core = coreName(name);
+  if (!core) return [];
+  const out = [core];
+  for (const alias of STATION_NAME_ALIASES[core] ?? []) {
+    if (alias && !out.includes(alias)) out.push(alias);
+  }
+  return out;
 }
 
 function haversineKm(
@@ -414,59 +482,67 @@ async function searchHeartRails(
   query: string,
   near: { lat: number; lng: number } | null,
 ): Promise<PlaceCandidate[]> {
-  const core = coreName(query);
-  if (!core) return [];
-  const url =
-    "https://express.heartrails.com/api/json?method=getStations&name=" +
-    encodeURIComponent(core);
-  const j = (await fetchJson(url)) as {
-    response?: {
-      station?: Array<{
-        name?: string;
-        prefecture?: string;
-        line?: string;
-        x?: number | string;
-        y?: number | string;
-      }>;
+  // Every name variant is queried: for a renamed station the old name
+  // errors out ("not found") and only the current official name hits.
+  // Candidates are scored against the variant that produced them, so
+  // an alias hit ranks as the exact match it is.
+  const out: PlaceCandidate[] = [];
+  for (const core of stationNameVariants(query)) {
+    const url =
+      "https://express.heartrails.com/api/json?method=getStations&name=" +
+      encodeURIComponent(core);
+    const j = (await fetchJson(url)) as {
+      response?: {
+        station?: Array<{
+          name?: string;
+          prefecture?: string;
+          line?: string;
+          x?: number | string;
+          y?: number | string;
+        }>;
+      };
     };
-  };
-  const stations = j.response?.station ?? [];
-  const groups = new Map<
-    string,
-    { name: string; prefecture: string; lines: string[]; lat: number; lng: number }
-  >();
-  for (const s of stations) {
-    const lat = Number(s.y);
-    const lng = Number(s.x);
-    if (!s.name || !Number.isFinite(lat) || !Number.isFinite(lng)) continue;
-    const key = `${s.name}|${lat.toFixed(3)},${lng.toFixed(3)}`;
-    const g = groups.get(key) ?? {
-      name: s.name,
-      prefecture: s.prefecture ?? "",
-      lines: [],
-      lat,
-      lng,
-    };
-    if (s.line && !g.lines.includes(s.line)) g.lines.push(s.line);
-    groups.set(key, g);
+    const stations = j.response?.station ?? [];
+    const groups = new Map<
+      string,
+      { name: string; prefecture: string; lines: string[]; lat: number; lng: number }
+    >();
+    for (const s of stations) {
+      const lat = Number(s.y);
+      const lng = Number(s.x);
+      if (!s.name || !Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+      const key = `${s.name}|${lat.toFixed(3)},${lng.toFixed(3)}`;
+      const g = groups.get(key) ?? {
+        name: s.name,
+        prefecture: s.prefecture ?? "",
+        lines: [],
+        lat,
+        lng,
+      };
+      if (s.line && !g.lines.includes(s.line)) g.lines.push(s.line);
+      groups.set(key, g);
+    }
+    for (const g of groups.values()) {
+      out.push(
+        scoreCandidate(
+          {
+            name: g.name.endsWith("駅") ? g.name : `${g.name}駅`,
+            address: [g.prefecture, g.lines.join("、")]
+              .filter(Boolean)
+              .join("｜"),
+            lat: g.lat,
+            lng: g.lng,
+            kind: "駅",
+            line: g.lines[0] ?? null,
+          },
+          core,
+          15,
+          near,
+        ),
+      );
+    }
   }
-  return [...groups.values()].map((g) =>
-    scoreCandidate(
-      {
-        name: g.name.endsWith("駅") ? g.name : `${g.name}駅`,
-        address: [g.prefecture, g.lines.join("、")]
-          .filter(Boolean)
-          .join("｜"),
-        lat: g.lat,
-        lng: g.lng,
-        kind: "駅",
-        line: g.lines[0] ?? null,
-      },
-      query,
-      15,
-      near,
-    ),
-  );
+  return out;
 }
 
 interface PhotonFeature {
@@ -832,11 +908,15 @@ async function pickEkitanDirection(
       .map((t) => coreName(t.trim()))
       .filter(Boolean);
 
+  // A renamed station (阪急梅田) is on the line diagram only under
+  // its current name (大阪梅田), so both ends match by any variant.
+  const boardingCores = stationNameVariants(boardingCore);
+  const alightingCores = stationNameVariants(alightingCore);
   try {
     const stations = await heartRailsLineStations(line);
     const cores = stations.map((s) => coreName(s.name));
-    const bi = cores.indexOf(boardingCore);
-    const ai = cores.indexOf(alightingCore);
+    const bi = cores.findIndex((c) => boardingCores.includes(c));
+    const ai = cores.findIndex((c) => alightingCores.includes(c));
     if (bi >= 0 && ai >= 0 && bi !== ai) {
       const side = new Set(
         ai > bi ? cores.slice(bi + 1) : cores.slice(0, bi).reverse(),
@@ -850,7 +930,11 @@ async function pickEkitanDirection(
   }
 
   for (const d of dirs) {
-    if (labelTokens(d.label).includes(alightingCore)) return d;
+    if (
+      labelTokens(d.label).some((t) => alightingCores.includes(t))
+    ) {
+      return d;
+    }
   }
 
   // Last resort: open each direction's first train and see which one
@@ -1715,7 +1799,7 @@ return { ok: true};
 
 searchPlaces: defineAction({
 description:
-"Searches places by spot name or address so a point on a route can be registered without typing coordinates. Railway stations come from the HeartRails station database (with line names), stations and bus stops also from tag-filtered OpenStreetMap/Photon, and spots/addresses from Nominatim bounded to Japan; results are merged, deduped, and ranked with stations and bus stops first. Optional nearLat/nearLng bias ranking toward a known nearby point (e.g. the previous spot on the route).",
+"Searches places by spot name or address so a point on a route can be registered without typing coordinates. Railway stations come from the HeartRails station database (with line names), stations and bus stops also from tag-filtered OpenStreetMap/Photon, and spots/addresses from Nominatim bounded to Japan; results are merged, deduped, and ranked with stations and bus stops first. Renamed stations are bridged to their current official names (e.g. 阪急梅田 → 大阪梅田), so searching the old name still returns the station. Optional nearLat/nearLng bias ranking toward a known nearby point (e.g. the previous spot on the route).",
 request: z.object({
 query: z.string().min(1).max(120),
 nearLat: z.number().min(-90).max(90).nullable().optional(),
@@ -1741,11 +1825,16 @@ args.nearLat != null && args.nearLng != null
 : null;
 const settled = await Promise.allSettled([
 searchHeartRails(query, near),
+// Station search runs once per name variant: a renamed station
+// (阪急梅田 → 大阪梅田) is only in OSM under its current name, and
+// each variant's results are scored against that variant.
+...stationNameVariants(query).map((v) =>
 searchPhoton(
-query,
+v,
 ["railway:station", "railway:tram_stop", "building:train_station"],
 "駅",
 near,
+),
 ),
 searchPhoton(query, ["highway:bus_stop"], "バス停", near),
 searchNominatim(query, near, false),
@@ -1769,20 +1858,28 @@ all = all.concat(extra);
 // keep what we have
 }
 }
-const byKey = new Map<string, PlaceCandidate>();
+// Dedupe by name + ~100 m, by real distance: a rounded-coordinate
+// key split one station into two candidates whenever its sources
+// straddled a rounding boundary (e.g. 大阪梅田駅 at lat 34.7054 vs
+// 34.7055 from Photon vs HeartRails). Same-name candidates ~450 m
+// apart (阪急 vs 阪神の大阪梅田) stay separate, as they should.
+const merged: PlaceCandidate[] = [];
 for (const c of all) {
-const key = `${c.name}|${c.lat.toFixed(3)},${c.lng.toFixed(3)}`;
-const prev = byKey.get(key);
+const prev = merged.find(
+(m) =>
+m.name === c.name &&
+haversineKm(m.lat, m.lng, c.lat, c.lng) < 0.1,
+);
 if (!prev) {
-byKey.set(key, c);
+merged.push(c);
 } else {
-byKey.set(key, {
+Object.assign(prev, {
 ...(c.score > prev.score ? c : prev),
 line: prev.line ?? c.line,
 });
 }
 }
-const places = [...byKey.values()]
+const places = merged
 .sort((a, b) => b.score - a.score)
 .slice(0, 10)
 .map((c) => ({
@@ -2097,8 +2194,11 @@ description:
 request: z.object({ station: z.string().min(1).max(80) }),
 response: z.object({ lines: z.array(z.string()) }),
 async handler(_ctx, args) {
-const core = coreName(args.station);
-if (!core) return { lines: [] };
+if (!coreName(args.station)) return { lines: [] };
+// Renamed stations resolve through their current official name
+// (阪急梅田 → 大阪梅田), whose rows carry the serving lines.
+const lines: string[] = [];
+for (const core of stationNameVariants(args.station)) {
 try {
 const j = (await fetchJson(
 "https://express.heartrails.com/api/json?method=getStations&name=" +
@@ -2106,16 +2206,16 @@ encodeURIComponent(core),
 )) as {
 response?: { station?: Array<{ name?: string; line?: string }> };
 };
-const lines: string[] = [];
 for (const s of j.response?.station ?? []) {
 if (s.name === core && s.line && !lines.includes(s.line)) {
 lines.push(s.line);
 }
 }
-return { lines };
 } catch {
-return { lines: [] };
+// try the next variant
 }
+}
+return { lines };
 },
 }),
 
@@ -2136,6 +2236,10 @@ async handler(ctx, args) {
 const db = ctx.db<typeof schema>();
 const stationCore = coreName(args.station);
 const towardCore = coreName(args.toward);
+// Renamed stations (阪急梅田 → 大阪梅田): station databases and
+// ekitan only know the current name, so resolution below matches
+// against every variant while the cache key stays the stored name.
+const stationCores = stationNameVariants(args.station);
 const cachedRow = (
 await db
 .select()
@@ -2238,7 +2342,7 @@ stationUrl: string,
 const html = await fetchPageText(stationUrl);
 if (!html) return null;
 const title = /<title>([^<]+)<\/title>/.exec(html)?.[1] ?? "";
-if (!title.includes(stationCore)) return null;
+if (!stationCores.some((c) => title.includes(c))) return null;
 const blocks = parseEkitanStationPage(html);
 const block = blocks.find((b) => lineNameMatch(args.line, b.line));
 return block ? block.directions : null;
@@ -2256,7 +2360,7 @@ let am: RegExpExecArray | null;
 while ((am = anchorRe.exec(html)) !== null) {
 const href = am[1];
 const name = (am[2] ?? "").replace(/\(.*?\)|（.*?）/gu, "");
-if (href && coreName(name) === stationCore) {
+if (href && stationCores.includes(coreName(name))) {
 return fromStationPage(EKITAN_BASE + href);
 }
 }
@@ -2282,8 +2386,8 @@ const PREFECTURE_AREA: Record<string, number> = {
 let prefArea: number | null = null;
 try {
 const stations = await heartRailsLineStations(args.line);
-const boarding = stations.find(
-(s) => coreName(s.name) === stationCore,
+const boarding = stations.find((s) =>
+stationCores.includes(coreName(s.name)),
 );
 if (boarding) {
 prefArea = PREFECTURE_AREA[boarding.prefecture] ?? null;
@@ -2387,7 +2491,7 @@ const url = `${EKITAN_BASE}/timetable/railway/line-station/${code}/${d}`;
 const html = await fetchPageText(url);
 if (!html) continue;
 const title = /<title>([^<]+)<\/title>/.exec(html)?.[1] ?? "";
-if (!title.includes(stationCore)) continue;
+if (!stationCores.some((c) => title.includes(c))) continue;
 const label = /(\S+方面)の時刻表/u.exec(title)?.[1];
 if (label) dirs.push({ url, label });
 }

@@ -102,6 +102,17 @@ Same endpoint as below, now `viewbox=124.0,24.0,146.0,46.0&bounded=1` (Japan onl
 **Sample output**: TLS connects, then `Empty reply from server` / timeout (exit 52) both times.
 **Why rejected**: unreachable from this environment; web_search against official operator pages works and carries provenance URLs.
 
+## Renamed-station aliases — 阪急梅田駅 not found as a station (edit 2026-11-10)
+- User report (verbatim in the edit brief): 「阪急梅田駅が駅として出てこないよ、バス停ならあるけど。」
+- Diagnosis (all verified live 2026-11-10): the station was renamed 阪急梅田 → 大阪梅田 in 2019, and every source only carries the current name. HeartRails `getStations&name=阪急梅田` → `{"error":"Station '阪急梅田' not found."}` (name=大阪梅田 returns the Hankyu 3 lines + 阪神本線 rows). Photon DID return the 大阪梅田 station node for q=阪急梅田, but `namePlausible` rejected it: bigram Dice（阪急梅田 vs 大阪梅田）= 0.333 < 0.34 threshold. Nominatim for 阪急梅田駅 returns only the `highway/bus_stop` 阪急梅田駅 — hence exactly the reported symptom (bus stop only, no station).
+- Fix (server-only, `actions.ts`):
+  - `STATION_NAME_ALIASES` + `stationNameVariants()`: old/operator-prefixed name cores → current official names. Entries verified live against HeartRails the same way （近鉄難波・阪神難波 → error, 大阪難波 → 近鉄奈良線/阪神なんば線； 河原町 → only Sendai/Kumamoto stations, 京都河原町 → 阪急京都本線； 三宮 → 神戸三宮 for the Hankyu/Hanshin station): 阪急梅田・阪神梅田 → 大阪梅田， 近鉄難波・阪神難波 → 大阪難波， 河原町 → 京都河原町， 三宮 → 神戸三宮.
+  - `searchHeartRails` and the station Photon pass in `searchPlaces` query every variant and score candidates against the variant that produced them (alias hit = exact match). `getStationLines` resolves lines through variants too.
+  - `namePlausible` gained a renamed-station shape rule: shared name tail ≥2 chars, ≤2 leftover chars per side, AND zero common prefix (the prefix condition keeps 金閣寺前 vs 金昌寺前・金泉寺前 — shared head 金 + tail 寺前， different stops — rejected; regression-tested).
+  - `fetchTimetable` matches boarding/alighting by any variant (HeartRails line diagram lookup, ekitan line-page anchors, station-page title checks, `pickEkitanDirection` side computation), so routes already stored with the old name keep working; the timetable cache key stays the stored name.
+  - Dedupe in `searchPlaces` changed from a rounded-coordinate key to name + real distance <100 m: 大阪梅田駅 from Photon (34.70542) vs HeartRails (34.70552) straddled the toFixed(3) boundary and showed twice; the 阪急/阪神 pair ~450 m apart still stays separate.
+- Verified via the built actions: `searchPlaces 阪急梅田駅` → 大阪梅田駅 （阪急京都本線・宝塚本線・神戸本線） first, 大阪梅田駅 （阪神本線） second, 阪急梅田駅 bus stop third (was: bus stop only). `getStationLines 阪急梅田駅` → the 3 Hankyu lines + 阪神本線. `fetchTimetable 阪急宝塚本線 / 阪急梅田駅 / 中津駅` → ekitan 大阪梅田駅（阪急） 宝塚方面， weekday 251 departures from 5:00. Regressions: 新宿駅 unchanged (per-operator station groups on top), 金閣寺前 → 金閣寺道 only, 京阪本線 出町柳→三条 still ekitan weekday 203 from 5:00.
+
 ## Imagery
 Imagery not needed: this is a functional real-time transit board — the hero is the live countdown/next-train display; there are no visual subjects to photograph or illustrate. Icons are Lucide glyphs.
 
