@@ -1057,6 +1057,19 @@ function BoardView({
         </div>
       </section>
 
+      {/* データについて */}
+      <section aria-label="データについて" className="mt-5">
+        <h2 className="text-xs font-bold text-[var(--dim)]">データについて</h2>
+        <div className="mt-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs leading-relaxed text-[var(--dim)]">
+          <p>
+            鉄道の路線図・時刻表は駅探と全国駅データ（HeartRails）から、バスの路線図・時刻表はGTFSデータリポジトリ（国土交通省）に収録された事業者のGTFSデータから取得しています（データ提供者の表記は各路線図・時刻表の出典に表示）。
+          </p>
+          <p className="mt-1">
+            京都市バスなど一部の事業者のGTFSデータは公共交通オープンデータセンター（ODPT）でのみ公開されており、利用には無料のアクセストークン（開発者登録）が必要です。このアプリにはトークンが設定されていないため、それらの事業者は路線図・時刻表の自動取得の対象外です。
+          </p>
+        </div>
+      </section>
+
       {/* 運行情報 */}
       <section aria-label="運行情報" className="mt-5">
         <h2 className="text-xs font-bold text-[var(--dim)]">運行情報（遅延の反映）</h2>

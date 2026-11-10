@@ -95,6 +95,50 @@ export const timetableCache = sqliteTable("timetable_cache", {
   fetchedAt: integer("fetched_at", { mode: "timestamp_ms" }),
 });
 
+// Bus GTFS-JP feeds from the MLIT GTFS Data Repository
+// (api.gtfs-data.jp, no API key). A feed is downloaded and parsed once,
+// then cached here: feed metadata + route list, per-route/direction
+// ordered stop lists (the bus "line diagram"), and per-stop departure
+// minutes split into weekday / holiday buckets. Board opens never
+// re-download a feed; rows refresh only when older than the TTL.
+export const gtfsFeedCache = sqliteTable("gtfs_feed_cache", {
+  // "<organization_id>/<feed_id>" in the repository.
+  feedKey: text("feed_key").primaryKey(),
+  orgName: text("org_name").notNull().default(""),
+  feedName: text("feed_name").notNull().default(""),
+  licenseName: text("license_name"),
+  pageUrl: text("page_url"),
+  // JSON: [{routeId, name, shortName}]
+  routes: text("routes"),
+  fetchedAt: integer("fetched_at", { mode: "timestamp_ms" }),
+});
+
+export const gtfsLineCache = sqliteTable("gtfs_line_cache", {
+  // "<feedKey>|<routeId>|<directionId>"
+  cacheKey: text("cache_key").primaryKey(),
+  feedKey: text("feed_key").notNull(),
+  routeId: text("route_id").notNull(),
+  routeName: text("route_name").notNull().default(""),
+  directionId: integer("direction_id").notNull(),
+  // Terminal stop name of this direction (the 方面 label).
+  toward: text("toward").notNull().default(""),
+  // JSON: [{name, lat, lng}] in travel order.
+  stops: text("stops"),
+  fetchedAt: integer("fetched_at", { mode: "timestamp_ms" }),
+});
+
+export const gtfsDepartures = sqliteTable("gtfs_departures", {
+  // "<feedKey>|<routeId>|<directionId>|<stop name core>"
+  cacheKey: text("cache_key").primaryKey(),
+  feedKey: text("feed_key").notNull(),
+  routeId: text("route_id").notNull(),
+  directionId: integer("direction_id").notNull(),
+  stopCore: text("stop_core").notNull(),
+  // JSON number[]: departure minutes-of-day.
+  weekday: text("weekday"),
+  holiday: text("holiday"),
+});
+
 export const appSettings = sqliteTable("app_settings", {
   id: integer("id").primaryKey(),
   activeRouteId: integer("active_route_id"),

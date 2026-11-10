@@ -9,6 +9,7 @@
 
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
 import { asc, desc, eq } from "drizzle-orm";
+import type { BatchItem } from "drizzle-orm/batch";
 import * as schema from "./schema";
 
 // ---------- shared zod shapes ----------
@@ -902,6 +903,624 @@ function nextJstDate(dow: number): string {
   return `${y}${mo}${da}`;
 }
 
+// ---------- bus GTFS-JP via the MLIT GTFS Data Repository ----------
+//
+// The repository (国土交通省 GTFSデータリポジトリ, gtfs-data.jp) is the
+// one no-key source that closes the bus gap: its public API v2
+// (https://api.gtfs-data.jp/v2, documented at
+// docs.gtfs-data.jp/api.v2.html) lists every published feed and serves
+// each feed's GTFS-JP ZIP at
+// /v2/organizations/<org>/feeds/<feed>/files/feed.zip?rid=current
+// (302 → S3; fetch follows it). Verified live 2026-11-10: 610 feeds,
+// licenses are per-feed CC BY / CC0 variants, so the operator (data
+// provider) credit is carried through to the UI wherever GTFS-derived
+// stops/times are shown. Kyoto's big operators （京都市交通局・京阪バス・
+// 阪急バス) are NOT in the repository — their GTFS is ODPT-only and
+// ODPT's API answers 403 "Require acl:consumerKey." without a token,
+// so those operators stay on the honest fallback (see DATA-PLAN.md).
+//
+// A feed is downloaded once, parsed (agency/routes/stops/trips/
+// stop_times/calendar), and materialized into gtfs_feed_cache /
+// gtfs_line_cache / gtfs_departures; after that, the line diagram and
+// timetables are served from the DB and the ZIP is only re-fetched
+// when the cache is older than GTFS_FEED_TTL_MS. The ZIP reader is
+// hand-rolled (central directory + DecompressionStream "deflate-raw",
+// both verified available in this runtime); no new dependency.
+// Day-type split follows the app's two-bucket model: a calendar
+// service counts as 平日 when it runs Mon–Fri and 土休日 when it runs
+// Sat/Sun (calendar_dates exceptions are not modeled).
+
+const GTFS_REPO_API = "https://api.gtfs-data.jp/v2";
+const GTFS_FEED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const GTFS_MAX_ZIP_BYTES = 30 * 1024 * 1024;
+const GTFS_MAX_STOP_TIME_ROWS = 2_000_000;
+const GTFS_MAX_DEPARTURE_ROWS = 40_000;
+
+interface GtfsStop {
+  name: string;
+  lat: number;
+  lng: number;
+}
+interface GtfsRouteInfo {
+  routeId: string;
+  name: string;
+  shortName: string;
+}
+interface GtfsDirectionInfo {
+  routeId: string;
+  routeName: string;
+  directionId: number;
+  toward: string;
+  stops: GtfsStop[];
+}
+interface GtfsDepartureInfo {
+  routeId: string;
+  directionId: number;
+  stopCore: string;
+  weekday: number[];
+  holiday: number[];
+}
+interface ParsedGtfs {
+  agencyName: string;
+  routes: GtfsRouteInfo[];
+  directions: GtfsDirectionInfo[];
+  departures: GtfsDepartureInfo[];
+}
+interface RepoFeedEntry {
+  organization_id?: string;
+  organization_name?: string;
+  feed_id?: string;
+  feed_name?: string;
+  feed_license?: string;
+  feed_license_id?: string;
+  feed_page_url?: string;
+}
+interface GtfsFeedMeta {
+  feedKey: string;
+  orgId: string;
+  feedId: string;
+  orgName: string;
+  feedName: string;
+  license: string | null;
+  pageUrl: string | null;
+}
+
+async function fetchBytes(
+  url: string,
+  timeoutMs = 60000,
+): Promise<Uint8Array | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": SEARCH_UA },
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return null;
+    return new Uint8Array(await res.arrayBuffer());
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Minimal ZIP reader: central directory + stored/deflate entries. */
+function unzipFiles(bytes: Uint8Array): Map<string, Uint8Array> {
+  const out = new Map<string, Uint8Array>();
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let eocd = -1;
+  for (let i = bytes.length - 22; i >= 0; i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd < 0) return out;
+  const count = dv.getUint16(eocd + 10, true);
+  let p = dv.getUint32(eocd + 16, true);
+  const dec = new TextDecoder();
+  // Entries are decompressed lazily by the caller via unzipFile().
+  for (let n = 0; n < count; n++) {
+    const method = dv.getUint16(p + 10, true);
+    const compSize = dv.getUint32(p + 20, true);
+    const nameLen = dv.getUint16(p + 28, true);
+    const extra = dv.getUint16(p + 30, true);
+    const comment = dv.getUint16(p + 32, true);
+    const localOff = dv.getUint32(p + 42, true);
+    const rawName = dec.decode(bytes.subarray(p + 46, p + 46 + nameLen));
+    const name = rawName.split("/").pop() ?? rawName;
+    const lNameLen = dv.getUint16(localOff + 26, true);
+    const lExtra = dv.getUint16(localOff + 28, true);
+    const dataStart = localOff + 30 + lNameLen + lExtra;
+    // Stash the compressed slice under a method-tagged key; the caller
+    // inflates only the files it needs.
+    const comp = bytes.subarray(dataStart, dataStart + compSize);
+    out.set(`${method}:${name}`, comp);
+    p += 46 + nameLen + extra + comment;
+  }
+  return out;
+}
+
+async function unzipFile(
+  files: Map<string, Uint8Array>,
+  name: string,
+): Promise<string | null> {
+  const stored = files.get(`0:${name}`);
+  if (stored) return new TextDecoder("utf-8").decode(stored);
+  const deflated = files.get(`8:${name}`);
+  if (!deflated) return null;
+  const source = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(deflated);
+      controller.close();
+    },
+  });
+  const stream = source.pipeThrough(new DecompressionStream("deflate-raw"));
+  const buf = await new Response(stream).arrayBuffer();
+  return new TextDecoder("utf-8").decode(buf);
+}
+
+function splitCsvLine(line: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (quoted) {
+      if (c === '"') {
+        if (line[i + 1] === '"') {
+          cur += '"';
+          i++;
+        } else {
+          quoted = false;
+        }
+      } else {
+        cur += c;
+      }
+    } else if (c === '"') {
+      quoted = true;
+    } else if (c === ",") {
+      out.push(cur);
+      cur = "";
+    } else {
+      cur += c;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+function parseCsvText(text: string): Record<string, string>[] {
+  const t = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  const lines = t.split(/\r\n|\n|\r/).filter((l) => l.length > 0);
+  const head = splitCsvLine(lines[0] ?? "");
+  const rows: Record<string, string>[] = [];
+  for (const line of lines.slice(1)) {
+    const cells = splitCsvLine(line);
+    const row: Record<string, string> = {};
+    head.forEach((h, i) => {
+      row[h] = cells[i] ?? "";
+    });
+    rows.push(row);
+  }
+  return rows;
+}
+
+/** "7:05:00" / "25:10:00" → minutes of day (kept within the app's <1560 cap). */
+function gtfsTimeToMin(v: string | undefined): number | null {
+  if (!v) return null;
+  const m = /^(\d{1,3}):(\d{2})(?::\d{2})?$/.exec(v.trim());
+  if (!m) return null;
+  const t = Number(m[1]) * 60 + Number(m[2]);
+  return t >= 0 && t < 1560 ? t : null;
+}
+
+async function parseGtfsFeed(
+  bytes: Uint8Array,
+): Promise<ParsedGtfs | null> {
+  const files = unzipFiles(bytes);
+  const [routesTxt, stopsTxt, tripsTxt, stopTimesTxt, calendarTxt, agencyTxt] =
+    await Promise.all([
+      unzipFile(files, "routes.txt"),
+      unzipFile(files, "stops.txt"),
+      unzipFile(files, "trips.txt"),
+      unzipFile(files, "stop_times.txt"),
+      unzipFile(files, "calendar.txt"),
+      unzipFile(files, "agency.txt"),
+    ]);
+  if (!routesTxt || !stopsTxt || !tripsTxt || !stopTimesTxt) return null;
+
+  const routes: GtfsRouteInfo[] = [];
+  for (const r of parseCsvText(routesTxt)) {
+    const routeId = (r.route_id ?? "").trim();
+    if (!routeId) continue;
+    const longName = (r.route_long_name ?? "").trim();
+    const shortName = (r.route_short_name ?? "").trim();
+    routes.push({
+      routeId,
+      name: longName || shortName || routeId,
+      shortName,
+    });
+  }
+  if (routes.length === 0) return null;
+  const routeNameById = new Map(routes.map((r) => [r.routeId, r.name]));
+
+  const stopsById = new Map<string, GtfsStop>();
+  for (const s of parseCsvText(stopsTxt)) {
+    const id = (s.stop_id ?? "").trim();
+    const name = (s.stop_name ?? "").trim();
+    const lat = Number(s.stop_lat);
+    const lng = Number(s.stop_lon);
+    if (!id || !name || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+      continue;
+    }
+    stopsById.set(id, { name, lat, lng });
+  }
+  if (stopsById.size === 0) return null;
+
+  // Calendar services → the app's weekday / holiday buckets. A feed
+  // without calendar.txt treats every service as running every day.
+  const serviceBuckets = new Map<
+    string,
+    { weekday: boolean; holiday: boolean }
+  >();
+  if (calendarTxt) {
+    for (const c of parseCsvText(calendarTxt)) {
+      const on = (k: string) => c[k] === "1";
+      const id = (c.service_id ?? "").trim();
+      if (!id) continue;
+      serviceBuckets.set(id, {
+        weekday:
+          on("monday") ||
+          on("tuesday") ||
+          on("wednesday") ||
+          on("thursday") ||
+          on("friday"),
+        holiday: on("saturday") || on("sunday"),
+      });
+    }
+  }
+  const bucketOf = (serviceId: string) =>
+    serviceBuckets.get(serviceId) ?? { weekday: true, holiday: true };
+
+  interface TripInfo {
+    routeId: string;
+    directionId: number;
+    serviceId: string;
+  }
+  const tripInfo = new Map<string, TripInfo>();
+  for (const t of parseCsvText(tripsTxt)) {
+    const tripId = (t.trip_id ?? "").trim();
+    const routeId = (t.route_id ?? "").trim();
+    if (!tripId || !routeId) continue;
+    const dir = Number.parseInt(t.direction_id ?? "", 10);
+    tripInfo.set(tripId, {
+      routeId,
+      directionId: Number.isFinite(dir) ? dir : 0,
+      serviceId: (t.service_id ?? "").trim(),
+    });
+  }
+  if (tripInfo.size === 0) return null;
+
+  const stopTimeRows = parseCsvText(stopTimesTxt);
+  if (stopTimeRows.length > GTFS_MAX_STOP_TIME_ROWS) return null;
+  interface StopTime {
+    stopId: string;
+    seq: number;
+    dep: number | null;
+  }
+  const timesByTrip = new Map<string, StopTime[]>();
+  for (const r of stopTimeRows) {
+    const tripId = (r.trip_id ?? "").trim();
+    const stopId = (r.stop_id ?? "").trim();
+    if (!tripId || !stopId) continue;
+    const seq = Number.parseInt(r.stop_sequence ?? "", 10);
+    const list = timesByTrip.get(tripId) ?? [];
+    list.push({
+      stopId,
+      seq: Number.isFinite(seq) ? seq : list.length,
+      dep: gtfsTimeToMin(r.departure_time) ?? gtfsTimeToMin(r.arrival_time),
+    });
+    timesByTrip.set(tripId, list);
+  }
+
+  // Line diagram per (route, direction): the trip with the most stops
+  // is the representative run; its stop order is the diagram.
+  const bestTrip = new Map<string, { tripId: string; count: number }>();
+  for (const [tripId, times] of timesByTrip) {
+    const info = tripInfo.get(tripId);
+    if (!info) continue;
+    const key = `${info.routeId}|${info.directionId}`;
+    const cur = bestTrip.get(key);
+    if (!cur || times.length > cur.count) {
+      bestTrip.set(key, { tripId, count: times.length });
+    }
+  }
+  const directions: GtfsDirectionInfo[] = [];
+  for (const best of bestTrip.values()) {
+    const info = tripInfo.get(best.tripId);
+    if (!info) continue;
+    const times = [...(timesByTrip.get(best.tripId) ?? [])].sort(
+      (a, b) => a.seq - b.seq,
+    );
+    const stops: GtfsStop[] = [];
+    for (const t of times) {
+      const stop = stopsById.get(t.stopId);
+      if (stop) stops.push(stop);
+    }
+    if (stops.length < 2) continue;
+    directions.push({
+      routeId: info.routeId,
+      routeName: routeNameById.get(info.routeId) ?? info.routeId,
+      directionId: info.directionId,
+      toward: stops[stops.length - 1]?.name ?? "",
+      stops,
+    });
+  }
+
+  // Departures per (route, direction, stop): union over every trip
+  // whose calendar service falls in the bucket.
+  const depMap = new Map<
+    string,
+    {
+      routeId: string;
+      directionId: number;
+      stopCore: string;
+      weekday: Set<number>;
+      holiday: Set<number>;
+    }
+  >();
+  for (const [tripId, times] of timesByTrip) {
+    const info = tripInfo.get(tripId);
+    if (!info) continue;
+    const bucket = bucketOf(info.serviceId);
+    for (const t of times) {
+      if (t.dep == null) continue;
+      const stop = stopsById.get(t.stopId);
+      if (!stop) continue;
+      const stopCore = coreName(stop.name);
+      if (!stopCore) continue;
+      const key = `${info.routeId}|${info.directionId}|${stopCore}`;
+      let entry = depMap.get(key);
+      if (!entry) {
+        entry = {
+          routeId: info.routeId,
+          directionId: info.directionId,
+          stopCore,
+          weekday: new Set(),
+          holiday: new Set(),
+        };
+        depMap.set(key, entry);
+      }
+      if (bucket.weekday) entry.weekday.add(t.dep);
+      if (bucket.holiday) entry.holiday.add(t.dep);
+    }
+  }
+  const departures: GtfsDepartureInfo[] = [...depMap.values()].map((e) => ({
+    routeId: e.routeId,
+    directionId: e.directionId,
+    stopCore: e.stopCore,
+    weekday: [...e.weekday].sort((a, b) => a - b),
+    holiday: [...e.holiday].sort((a, b) => a - b),
+  }));
+  if (departures.length > GTFS_MAX_DEPARTURE_ROWS) return null;
+
+  let agencyName = "";
+  if (agencyTxt) {
+    const first = parseCsvText(agencyTxt)[0];
+    agencyName = (first?.agency_name ?? "").trim();
+  }
+  return { agencyName, routes, directions, departures };
+}
+
+let repoCatalogCache: { at: number; feeds: RepoFeedEntry[] } | null = null;
+
+async function repoCatalog(): Promise<RepoFeedEntry[]> {
+  if (
+    repoCatalogCache &&
+    Date.now() - repoCatalogCache.at < 6 * 60 * 60 * 1000
+  ) {
+    return repoCatalogCache.feeds;
+  }
+  try {
+    const j = (await fetchJson(`${GTFS_REPO_API}/feeds`, 30000)) as {
+      body?: RepoFeedEntry[];
+    };
+    const feeds = Array.isArray(j.body) ? j.body : [];
+    if (feeds.length > 0) repoCatalogCache = { at: Date.now(), feeds };
+    return feeds;
+  } catch {
+    return repoCatalogCache?.feeds ?? [];
+  }
+}
+
+async function repoFeedMeta(
+  orgId: string,
+  feedId: string,
+): Promise<GtfsFeedMeta> {
+  const feedKey = `${orgId}/${feedId}`;
+  const catalog = await repoCatalog();
+  const hit = catalog.find(
+    (f) => f.organization_id === orgId && f.feed_id === feedId,
+  );
+  let orgName = hit?.organization_name ?? "";
+  let feedName = hit?.feed_name ?? "";
+  let license = hit?.feed_license ?? hit?.feed_license_id ?? null;
+  let pageUrl = hit?.feed_page_url ?? null;
+  if (!hit) {
+    try {
+      const j = (await fetchJson(
+        `${GTFS_REPO_API}/organizations/${encodeURIComponent(orgId)}/feeds/${encodeURIComponent(feedId)}`,
+        15000,
+      )) as {
+        body?: {
+          organization_name?: string;
+          feed_name?: string;
+          feed_license?: string;
+          feed_page_url?: string;
+        };
+      };
+      orgName = j.body?.organization_name ?? orgName;
+      feedName = j.body?.feed_name ?? feedName;
+      license = j.body?.feed_license ?? license;
+      pageUrl = j.body?.feed_page_url ?? pageUrl;
+    } catch {
+      // metadata stays partial; the feed itself can still be parsed
+    }
+  }
+  // The repository's per-feed page (documented URL shape, also the
+  // feed_page_url the API itself returns).
+  if (!pageUrl) {
+    pageUrl = `https://gtfs-data.jp/search?target_feed=${orgId}*${feedId}`;
+  }
+  return { feedKey, orgId, feedId, orgName, feedName, license, pageUrl };
+}
+
+/**
+ * Download + parse + cache one repository feed (unless a fresh copy is
+ * already cached). Returns the feed metadata and its route list.
+ */
+async function ensureGtfsFeed(
+  ctx: Ctx,
+  orgId: string,
+  feedId: string,
+): Promise<{ meta: GtfsFeedMeta; routes: GtfsRouteInfo[] } | null> {
+  const db = ctx.db<typeof schema>();
+  const feedKey = `${orgId}/${feedId}`;
+  const cached = (
+    await db
+      .select()
+      .from(schema.gtfsFeedCache)
+      .where(eq(schema.gtfsFeedCache.feedKey, feedKey))
+  )[0];
+  if (
+    cached?.fetchedAt &&
+    cached.routes &&
+    Date.now() - cached.fetchedAt.getTime() < GTFS_FEED_TTL_MS
+  ) {
+    try {
+      const routes = JSON.parse(cached.routes) as GtfsRouteInfo[];
+      if (Array.isArray(routes) && routes.length > 0) {
+        return {
+          meta: {
+            feedKey,
+            orgId,
+            feedId,
+            orgName: cached.orgName,
+            feedName: cached.feedName,
+            license: cached.licenseName,
+            pageUrl: cached.pageUrl,
+          },
+          routes,
+        };
+      }
+    } catch {
+      // fall through and re-ingest
+    }
+  }
+
+  const meta = await repoFeedMeta(orgId, feedId);
+  const zip = await fetchBytes(
+    `${GTFS_REPO_API}/organizations/${encodeURIComponent(orgId)}/feeds/${encodeURIComponent(feedId)}/files/feed.zip?rid=current`,
+    90000,
+  );
+  if (!zip || zip.length > GTFS_MAX_ZIP_BYTES) return null;
+  let parsed: ParsedGtfs | null = null;
+  try {
+    parsed = await parseGtfsFeed(zip);
+  } catch {
+    parsed = null;
+  }
+  if (!parsed || parsed.routes.length === 0) return null;
+
+  const orgName = meta.orgName || parsed.agencyName || "";
+  const now = new Date();
+  const statements: BatchItem<"sqlite">[] = [
+    db
+      .delete(schema.gtfsLineCache)
+      .where(eq(schema.gtfsLineCache.feedKey, feedKey)),
+    db
+      .delete(schema.gtfsDepartures)
+      .where(eq(schema.gtfsDepartures.feedKey, feedKey)),
+    db
+      .insert(schema.gtfsFeedCache)
+      .values({
+        feedKey,
+        orgName,
+        feedName: meta.feedName,
+        licenseName: meta.license,
+        pageUrl: meta.pageUrl,
+        routes: JSON.stringify(parsed.routes),
+        fetchedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: schema.gtfsFeedCache.feedKey,
+        set: {
+          orgName,
+          feedName: meta.feedName,
+          licenseName: meta.license,
+          pageUrl: meta.pageUrl,
+          routes: JSON.stringify(parsed.routes),
+          fetchedAt: now,
+        },
+      }),
+  ];
+  for (const d of parsed.directions) {
+    statements.push(
+      db.insert(schema.gtfsLineCache).values({
+        cacheKey: `${feedKey}|${d.routeId}|${d.directionId}`,
+        feedKey,
+        routeId: d.routeId,
+        routeName: d.routeName,
+        directionId: d.directionId,
+        toward: d.toward,
+        stops: JSON.stringify(d.stops),
+        fetchedAt: now,
+      }),
+    );
+  }
+  for (const dep of parsed.departures) {
+    statements.push(
+      db.insert(schema.gtfsDepartures).values({
+        cacheKey: `${feedKey}|${dep.routeId}|${dep.directionId}|${dep.stopCore}`,
+        feedKey,
+        routeId: dep.routeId,
+        directionId: dep.directionId,
+        stopCore: dep.stopCore,
+        weekday: JSON.stringify(dep.weekday),
+        holiday: JSON.stringify(dep.holiday),
+      }),
+    );
+  }
+  for (let i = 0; i < statements.length; i += 100) {
+    const chunk = statements.slice(i, i + 100);
+    const [first, ...rest] = chunk;
+    if (first) await db.batch([first, ...rest]);
+  }
+  return { meta: { ...meta, orgName }, routes: parsed.routes };
+}
+
+function parseGtfsStopsJson(raw: string | null): GtfsStop[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (s): s is GtfsStop =>
+          typeof s === "object" &&
+          s !== null &&
+          typeof (s as GtfsStop).name === "string" &&
+          typeof (s as GtfsStop).lat === "number" &&
+          typeof (s as GtfsStop).lng === "number",
+      )
+      .map((s) => ({ name: s.name, lat: s.lat, lng: s.lng }));
+  } catch {
+    return [];
+  }
+}
+
 // ---------- actions ----------
 
 export const Actions = {
@@ -1502,7 +2121,7 @@ return { lines: [] };
 
 fetchTimetable: defineAction({
 description:
-"Automatically fetches the departure timetable for one ride segment (line + boarding station + direction toward the alighting station). Primary source is the ekitan (駅探) station timetable for that station/line/direction, parsed deterministically (weekday times from a Tuesday service day, holiday times from a Saturday); if that fails, timetable pages found via web search are extracted with model inference. Results are cached in timetable_cache with the source URL and returned. Departure times are never typed by the user.",
+"Automatically fetches the departure timetable for one ride segment (line + boarding station + direction toward the alighting station). For bus segments whose stops were picked from a GTFS-JP line diagram, the times come from the cached GTFS feed (MLIT GTFS Data Repository). For rail, the primary source is the ekitan (駅探) station timetable for that station/line/direction, parsed deterministically (weekday times from a Tuesday service day, holiday times from a Saturday); if that fails, timetable pages found via web search are extracted with model inference. Results are cached in timetable_cache with the source URL and returned. Departure times are never typed by the user.",
 request: z.object({
 line: z.string().min(1).max(80),
 station: z.string().min(1).max(80),
@@ -1548,6 +2167,61 @@ holiday: number[];
 url: string;
 title: string | null;
 }
+
+// --- bus: GTFS-JP feeds cached from the GTFS Data Repository ---
+// Only feeds the user has already opened in the route editor are in
+// the cache, so this is a pure DB lookup: the line diagram the user
+// picked the stops from identifies the feed, route and direction.
+const tryGtfs = async (): Promise<Fetched | null> => {
+try {
+const rows = await db.select().from(schema.gtfsLineCache);
+let best: (typeof rows)[number] | null = null;
+let bestExact = false;
+for (const row of rows) {
+if (!lineNameMatch(args.line, row.routeName)) continue;
+const cores = parseGtfsStopsJson(row.stops).map((s) => coreName(s.name));
+const bi = cores.indexOf(stationCore);
+const ai = cores.indexOf(towardCore);
+if (bi < 0 || ai <= bi) continue;
+const exact = coreName(row.routeName) === coreName(args.line);
+if (!best || (exact && !bestExact)) {
+best = row;
+bestExact = exact;
+}
+}
+if (!best) return null;
+const dep = (
+await db
+.select()
+.from(schema.gtfsDepartures)
+.where(
+eq(
+schema.gtfsDepartures.cacheKey,
+`${best.feedKey}|${best.routeId}|${best.directionId}|${stationCore}`,
+),
+)
+)[0];
+if (!dep) return null;
+const weekday = parseMinuteList(dep.weekday);
+if (weekday.length === 0) return null;
+const holiday = parseMinuteList(dep.holiday);
+const feedRow = (
+await db
+.select()
+.from(schema.gtfsFeedCache)
+.where(eq(schema.gtfsFeedCache.feedKey, best.feedKey))
+)[0];
+const provider = feedRow?.orgName || feedRow?.feedName || "GTFSデータ";
+return {
+weekday,
+holiday,
+url: feedRow?.pageUrl ?? "https://gtfs-data.jp/",
+title: `GTFSデータ（${provider}${feedRow?.feedName ? `・${feedRow.feedName}` : ""}／GTFSデータリポジトリ）`,
+};
+} catch {
+return null;
+}
+};
 
 // --- primary: ekitan station timetable (deterministic parse) ---
 // Search engines barely index ekitan station pages, so the boarding
@@ -1834,11 +2508,14 @@ return null;
 
 let fetched: Fetched | null = null;
 let ekitanError = "";
+fetched = await tryGtfs();
+if (!fetched) {
 const ek = await tryEkitan();
 if ("error" in ek) {
 ekitanError = ek.error;
 } else {
 fetched = ek;
+}
 }
 if (!fetched) fetched = await tryGeneric();
 if (!fetched) {
@@ -1877,6 +2554,182 @@ await db
 .where(eq(schema.timetableCache.line, args.line))
 ).find((r) => r.station === stationCore && r.toward === towardCore);
 return { ok: true, message: null, timetable: toShape(saved) };
+},
+}),
+
+searchBusFeeds: defineAction({
+description:
+"Finds bus GTFS-JP feeds published in the MLIT GTFS Data Repository (no API key): feeds serving the area around a point (the repository's extent search) and/or feeds whose operator or feed name matches a query. Returns feed identifiers plus the operator/feed names and license for attribution.",
+request: z.object({
+query: z.string().max(60),
+lat: z.number().min(-90).max(90).nullable(),
+lng: z.number().min(-180).max(180).nullable(),
+}),
+response: z.object({
+feeds: z.array(
+z.object({
+orgId: z.string(),
+feedId: z.string(),
+orgName: z.string(),
+feedName: z.string(),
+license: z.string().nullable(),
+}),
+),
+}),
+async handler(_ctx, args) {
+type Hit = {
+orgId: string;
+feedId: string;
+orgName: string;
+feedName: string;
+license: string | null;
+};
+const out = new Map<string, Hit>();
+const add = (f: RepoFeedEntry) => {
+const orgId = f.organization_id ?? "";
+const feedId = f.feed_id ?? "";
+if (!orgId || !feedId || out.has(`${orgId}/${feedId}`)) return;
+out.set(`${orgId}/${feedId}`, {
+orgId,
+feedId,
+orgName: f.organization_name ?? "",
+feedName: f.feed_name ?? "",
+license: f.feed_license ?? f.feed_license_id ?? null,
+});
+};
+// Feeds serving the area around the boarding stop.
+if (args.lat != null && args.lng != null) {
+try {
+const extent = [
+args.lng - 0.065,
+args.lat - 0.055,
+args.lng + 0.065,
+args.lat + 0.055,
+]
+.map((n) => n.toFixed(5))
+.join(",");
+const j = (await fetchJson(
+`${GTFS_REPO_API}/files?extent=${extent}`,
+20000,
+)) as { body?: RepoFeedEntry[] };
+for (const f of j.body ?? []) add(f);
+} catch {
+// name search below may still find feeds
+}
+}
+// Feeds whose operator / feed name matches the query text.
+const q = args.query.trim();
+if (q) {
+const catalog = await repoCatalog();
+const qCore = coreName(q);
+for (const f of catalog) {
+if (
+coreName(f.organization_name ?? "").includes(qCore) ||
+coreName(f.feed_name ?? "").includes(qCore)
+) {
+add(f);
+}
+}
+try {
+const j = (await fetchJson(
+`${GTFS_REPO_API}/feeds?org_name=${encodeURIComponent(q)}`,
+15000,
+)) as { body?: RepoFeedEntry[] };
+for (const f of j.body ?? []) add(f);
+} catch {
+// catalog matches above are enough
+}
+}
+return { feeds: [...out.values()].slice(0, 12) };
+},
+}),
+
+getBusFeedRoutes: defineAction({
+description:
+"Returns the route list of one bus GTFS-JP feed from the MLIT GTFS Data Repository, downloading and caching the feed on first use (later calls read the cache). Includes the operator/feed names and license so the UI can show the data-provider credit.",
+request: z.object({
+orgId: z.string().min(1).max(120),
+feedId: z.string().min(1).max(120),
+}),
+response: z.object({
+found: z.boolean(),
+orgName: z.string(),
+feedName: z.string(),
+license: z.string().nullable(),
+pageUrl: z.string().nullable(),
+routes: z.array(
+z.object({
+routeId: z.string(),
+name: z.string(),
+shortName: z.string(),
+}),
+),
+}),
+async handler(ctx, args) {
+const ing = await ensureGtfsFeed(ctx, args.orgId, args.feedId);
+if (!ing) {
+return {
+found: false,
+orgName: "",
+feedName: "",
+license: null,
+pageUrl: null,
+routes: [],
+};
+}
+return {
+found: true,
+orgName: ing.meta.orgName,
+feedName: ing.meta.feedName,
+license: ing.meta.license,
+pageUrl: ing.meta.pageUrl,
+routes: ing.routes,
+};
+},
+}),
+
+getBusRouteStops: defineAction({
+description:
+"Returns the ordered stop list (the bus line diagram) of one route of a GTFS-JP feed, per direction with the terminal stop name as the direction label. Stops come from the feed cached by getBusFeedRoutes / the timetable fetch, never from general place search.",
+request: z.object({
+orgId: z.string().min(1).max(120),
+feedId: z.string().min(1).max(120),
+routeId: z.string().min(1).max(160),
+}),
+response: z.object({
+found: z.boolean(),
+directions: z.array(
+z.object({
+directionId: z.number(),
+toward: z.string(),
+stops: z.array(
+z.object({
+name: z.string(),
+lat: z.number(),
+lng: z.number(),
+}),
+),
+}),
+),
+}),
+async handler(ctx, args) {
+const db = ctx.db<typeof schema>();
+const ing = await ensureGtfsFeed(ctx, args.orgId, args.feedId);
+if (!ing) return { found: false, directions: [] };
+const rows = await db
+.select()
+.from(schema.gtfsLineCache)
+.where(eq(schema.gtfsLineCache.feedKey, ing.meta.feedKey));
+const directions = rows
+.filter((r) => r.routeId === args.routeId)
+.sort((a, b) => a.directionId - b.directionId)
+.map((r) => ({
+directionId: r.directionId,
+toward: r.toward,
+stops: parseGtfsStopsJson(r.stops),
+}))
+.filter((d) => d.stops.length >= 2);
+return { found: directions.length > 0, directions };
 },
 }),
 } satisfies ActionsModule;

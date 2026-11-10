@@ -29,6 +29,13 @@
       "when": 1794303342778,
       "tag": "0004_timetable_cache",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1794306457694,
+      "tag": "0005_add_gtfs_bus_tables",
+      "breakpoints": true
     }
   ]
 }
