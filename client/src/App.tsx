@@ -1386,23 +1386,12 @@ function BoardView({
             {/* 行程の内訳 */}
             <ol className="mt-3 space-y-2">
               {shownPlan.legs.map((leg, i) => {
-                const prevRide = shownPlan.legs
-                  .slice(0, i)
-                  .filter((l) => l.kind === "ride")
-                  .pop();
-                const waitMin =
-                  leg.kind === "ride" && prevRide?.arrive != null && leg.depart != null
-                    ? Math.max(
-                        0,
-                        Math.round(
-                          leg.depart -
-                            prevRide.arrive -
-                            (activeRoute.segments.find(
-                              (s) => s.id === leg.segmentId,
-                            )?.accessMin ?? 0),
-                        ),
-                      )
-                    : null;
+                // Platform wait comes from predict.ts (leg.waitMin),
+                // which already excludes the walk minutes and the
+                // access minutes between the two rides. Recomputing
+                // it here from depart − previous arrival alone would
+                // count the transfer walk as waiting a second time.
+                const waitMin = leg.kind === "ride" ? leg.waitMin : null;
                 return (
                   <li key={`${leg.segmentId}-${i}`} className="flex items-start gap-2.5 text-sm">
                     {leg.kind === "walk" ? (
@@ -1556,7 +1545,7 @@ function BoardView({
             乗り換えの選択（{stationLabel(firstRideSeg.station ?? firstRideSeg.fromLabel)}から乗れる電車）
           </h2>
           <p className="mt-1 text-xs leading-relaxed text-[var(--dim)]">
-            いまから乗り継げる電車ごとに、途中の駅で速い電車（特急・快速など）に「乗り換える」か、そのまま「乗り換えない」かを切り替えて、その先の駅で乗れる電車と最終到着がどう変わるか比べられます。出発を1本遅らせた場合も同じ見方です。
+            いまから乗り継げる電車ごとに、途中の駅で速い電車（特急・快速など）に「乗り換える」か、そのまま「乗り換えない」かを切り替えて、その先の駅で乗れる電車と最終到着がどう変わるか比べられます。出発を1本遅らせた場合も同じ見方です。各タブには最終到着を表示しています。「待ち」は徒歩と駅構内の移動を除いた、ホームで待つ時間だけです（徒歩は連鎖の中に別に表示されます）。
           </p>
           {(() => {
             const groups: {
@@ -1606,6 +1595,14 @@ function BoardView({
                 >
                   {groups.map((g) => {
                     const active = selGroup?.depart === g.depart;
+                    // The point of the tab is the END of the chain:
+                    // show where this departure ultimately lands
+                    // (best variant of this departure), not just the
+                    // first leg, before the user even taps.
+                    const gArrive = Math.min(
+                      ...g.choices.map((c) => c.plan.arriveAt),
+                    );
+                    const gDelta = Math.round(gArrive - fastestArrive);
                     return (
                       <button
                         key={g.depart}
@@ -1641,6 +1638,12 @@ function BoardView({
                             {g.laterBy}本遅らせる
                           </span>
                         )}
+                        <span className="block text-[11px] font-bold opacity-80">
+                          最終 {fmtTime(gArrive)}着
+                          {gDelta > 0
+                            ? `（最速より+${gDelta}分）`
+                            : "（最速）"}
+                        </span>
                       </button>
                     );
                   })}
@@ -1677,6 +1680,11 @@ function BoardView({
                             {c.mode === "transfer"
                               ? `${c.expressType ?? ""}に乗り換え`
                               : "直通・座ったまま"}
+                            {" → 最終 "}
+                            {fmtTime(c.plan.arriveAt)}着
+                            {Math.round(c.plan.arriveAt - fastestArrive) > 0
+                              ? `（+${Math.round(c.plan.arriveAt - fastestArrive)}分）`
+                              : ""}
                           </span>
                         </button>
                       );
@@ -1721,10 +1729,54 @@ function BoardView({
                       乗り換え待ち合計 {selChoice.plan.totalWaitMin}分
                     </p>
                     <ol className="mt-2 space-y-1.5">
-                      {selChoice.plan.legs
-                        .filter((l) => l.kind === "ride")
-                        .map((leg) => (
-                          <li key={leg.segmentId} className="text-sm">
+                      {selChoice.plan.legs.map((leg, legIdx) => {
+                        if (leg.kind === "walk") {
+                          // Walk legs belong in the chain: the wait
+                          // shown at the next ride is what remains
+                          // AFTER this walk (and the station access),
+                          // so the sequence arrival → walk → wait →
+                          // departure must be readable as-is.
+                          return (
+                            <li
+                              key={`${leg.segmentId}-${legIdx}`}
+                              className="flex items-center gap-1.5 text-xs text-[var(--dim)]"
+                            >
+                              <WalkIcon size={13} className="shrink-0" />
+                              徒歩 {leg.label}
+                              <span className="tnum font-bold">
+                                約{leg.walkMin ?? "?"}分
+                              </span>
+                            </li>
+                          );
+                        }
+                        // Cascade annotation: when this departure
+                        // group has the other variant (乗り換える /
+                        // 乗り換えない), name the train that variant
+                        // catches at THIS downstream station, so the
+                        // knock-on difference is visible per station
+                        // rather than only in the final arrival.
+                        const sibling =
+                          selGroup && selGroup.choices.length > 1
+                            ? selGroup.choices.find(
+                                (c) => c.id !== selChoice.id,
+                              )
+                            : undefined;
+                        const sibLeg = sibling?.plan.legs.find(
+                          (l) =>
+                            l.kind === "ride" &&
+                            l.segmentId === leg.segmentId,
+                        );
+                        const sibDiffers =
+                          sibLeg != null &&
+                          sibLeg.depart != null &&
+                          leg.depart != null &&
+                          Math.round(sibLeg.depart) !==
+                            Math.round(leg.depart);
+                        return (
+                          <li
+                            key={`${leg.segmentId}-${legIdx}`}
+                            className="text-sm"
+                          >
                             {leg.waitMin != null && (
                               <span
                                 className={`mb-0.5 inline-block rounded px-1.5 py-0.5 text-[11px] font-bold ${
@@ -1780,8 +1832,18 @@ function BoardView({
                                 着
                               </span>
                             </p>
+                            {sibDiffers && sibLeg && (
+                              <p className="text-[11px] font-bold text-[var(--dim)]">
+                                もう一方の選択では、この駅で{" "}
+                                <span className="tnum">
+                                  {fmtTime(sibLeg.depart as number)}発
+                                </span>
+                                に乗る
+                              </p>
+                            )}
                           </li>
-                        ))}
+                        );
+                      })}
                     </ol>
                     <button
                       type="button"
@@ -1844,7 +1906,7 @@ function BoardView({
             シナリオ比較（今からこの経路を辿ったら）
           </h2>
           <p className="mt-1 text-xs leading-relaxed text-[var(--dim)]">
-            各駅で最初に乗れる電車に乗り継ぐ「最短」と、どこか1か所で1本見送る場合を、最後の到着まで計算し直した比較です。途中で早く着いても最後の乗り換えで長く待つかどうかが、ここで見分けられます。
+            各駅で最初に乗れる電車に乗り継ぐ「最短」と、どこか1か所で1本見送る場合を、最後の到着まで計算し直した比較です。途中で早く着いても最後の乗り換えで長く待つかどうかが、ここで見分けられます。「待ち」は徒歩と駅構内の移動を除いた、ホームで待つ時間だけです。
           </p>
           <div className="mt-2 space-y-2">
             {scenarios.map((s) => {
@@ -1893,9 +1955,21 @@ function BoardView({
                     </span>
                   </div>
                   <ol className="mt-2 space-y-1.5">
-                    {s.plan.legs
-                      .filter((l) => l.kind === "ride")
-                      .map((leg) => {
+                    {s.plan.legs.map((leg, legIdx) => {
+                        if (leg.kind === "walk") {
+                          return (
+                            <li
+                              key={`${leg.segmentId}-${legIdx}`}
+                              className="flex items-center gap-1.5 text-xs text-[var(--dim)]"
+                            >
+                              <WalkIcon size={13} className="shrink-0" />
+                              徒歩 {leg.label}
+                              <span className="tnum font-bold">
+                                約{leg.walkMin ?? "?"}分
+                              </span>
+                            </li>
+                          );
+                        }
                         const baseLeg = baselineLegs.get(leg.segmentId);
                         const diff =
                           !isBaseline &&
@@ -1904,7 +1978,7 @@ function BoardView({
                             ? Math.round(leg.depart - baseLeg.depart)
                             : 0;
                         return (
-                          <li key={leg.segmentId} className="text-sm">
+                          <li key={`${leg.segmentId}-${legIdx}`} className="text-sm">
                             {leg.waitMin != null && (
                               <span
                                 className={`mb-0.5 inline-block rounded px-1.5 py-0.5 text-[11px] font-bold ${

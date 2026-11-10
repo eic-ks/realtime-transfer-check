@@ -271,8 +271,13 @@ export interface LegPlan {
   arrive: number | null; // effective arrival at alighting station
   delayMin: number;
   suspended: boolean;
-  /** Transfer wait before this ride: depart − previous ride's arrival
-   * − this segment's access minutes. Null for walks and the first ride. */
+  /** Platform wait before this ride: depart − previous ride's
+   * arrival − the walk minutes between the two rides − this
+   * segment's access minutes. The walk and the station access are
+   * travel time, NOT waiting: counting them here as well would
+   * double-count them (they already appear as their own legs /
+   * in the chain's earliest-catchable computation). Null for walks
+   * and the first ride. */
   waitMin: number | null;
   /** Train type of the ridden train (特急/快速/普通…), when per-train
    * data is available for this segment. */
@@ -304,7 +309,9 @@ export interface PlanOption {
   /** Minutes from the start point to the first platform (walks + access). */
   toPlatformMin: number;
   nextDay: boolean;
-  /** Sum of transfer waits between rides (access minutes excluded). */
+  /** Sum of platform waits between rides (the walk minutes and
+   * access minutes between rides are travel time, not waiting,
+   * and are excluded — see LegPlan.waitMin). */
   totalWaitMin: number;
 }
 
@@ -552,13 +559,21 @@ export function computePlans(
     let boardAtSched = 0;
     let rideCount = 0;
     let prevRideArrive: number | null = null;
+    // Walk minutes accumulated since the previous ride's arrival.
+    // They are part of the transfer MOVEMENT, so the platform wait
+    // of the next ride must subtract them (in addition to that
+    // ride's access minutes) — otherwise the same walking minutes
+    // are counted twice: once as the walk leg, once as "waiting".
+    let walkSincePrevRide = 0;
     let totalWaitMin = 0;
     for (let i = firstRideIdx; i < segs.length; i++) {
       const seg = segs[i];
       if (!seg) continue;
       if (seg.type === "walk") {
         legs.push(walkLeg(seg));
-        cur += walkMinutes(seg) ?? 0;
+        const w = walkMinutes(seg) ?? 0;
+        cur += w;
+        if (rideCount > 0) walkSincePrevRide += w;
         continue;
       }
       if (seg.type !== "ride") continue;
@@ -587,7 +602,12 @@ export function computePlans(
         rideCount > 0 && prevRideArrive != null
           ? Math.max(
               0,
-              Math.round(departAbs - prevRideArrive - (seg.accessMin ?? 0)),
+              Math.round(
+                departAbs -
+                  prevRideArrive -
+                  walkSincePrevRide -
+                  (seg.accessMin ?? 0),
+              ),
             )
           : null;
       if (waitMin != null) totalWaitMin += waitMin;
@@ -625,6 +645,7 @@ export function computePlans(
           : null,
       });
       prevRideArrive = arrive;
+      walkSincePrevRide = 0;
       cur = arrive;
     }
     if (rideCount === 0) return null;
