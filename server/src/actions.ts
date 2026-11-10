@@ -251,6 +251,368 @@ recordedAt: log.recordedAt.toISOString(),
 };
 }
 
+// ---------- place search helpers ----------
+//
+// Station / bus-stop searchability: a single free-text geocoder query is
+// not enough in Japan. Nominatim alone returns foreign same-shaped names
+// for 「新宿駅」, station entrances instead of the station itself, and
+// traffic signals instead of bus stops （金閣寺前）. So searchPlaces fans
+// out to sources that are each good at one kind of place and merges:
+//   - HeartRails Express (free station database): exact railway stations
+//     by partial name, with line names and coordinates.
+//   - Photon (OSM autocomplete) tag-filtered to railway stations and to
+//     bus stops: good partial-name matching for both.
+//   - Nominatim bounded to Japan: spots, addresses, and anything else.
+// Results are name-scored, deduped by name + ~100 m, and ranked with
+// stations / bus stops first.
+
+interface PlaceCandidate {
+  name: string;
+  address: string;
+  lat: number;
+  lng: number;
+  kind: string;
+  line: string | null;
+  score: number;
+}
+
+const SEARCH_UA = "MuseTransitGuide/1.0 (personal transit artifact)";
+// Japan bounding box (lon/lat): Okinawa to Hokkaido.
+const JP_BBOX = "124.0,24.0,146.0,45.5";
+
+async function fetchJson(url: string, timeoutMs = 8000): Promise<unknown> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": SEARCH_UA },
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
+    return (await res.json()) as unknown;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Query/name with the generic suffix stripped, for name matching. */
+function coreName(s: string): string {
+  return s
+    .replace(/\s+/g, "")
+    .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+    .replace(/(駅|バス停|停留所)$/u, "");
+}
+
+function nameMatchScore(query: string, name: string): number {
+  const q = coreName(query);
+  const n = coreName(name);
+  if (!q || !n) return 0;
+  if (n === q) return 100;
+  if (n.startsWith(q) || q.startsWith(n)) return 70;
+  if (n.includes(q) || q.includes(n)) return 55;
+  return 0;
+}
+
+function bigramDice(a: string, b: string): number {
+  if (a.length < 2 || b.length < 2) return a === b ? 1 : 0;
+  const grams = (s: string) => {
+    const set = new Set<string>();
+    for (let i = 0; i < s.length - 1; i++) set.add(s.slice(i, i + 2));
+    return set;
+  };
+  const A = grams(a);
+  const B = grams(b);
+  let hit = 0;
+  for (const g of A) if (B.has(g)) hit++;
+  return A.size + B.size === 0 ? 0 : (2 * hit) / (A.size + B.size);
+}
+
+/** True when a fuzzy source result plausibly refers to the queried name. */
+function namePlausible(query: string, name: string): boolean {
+  if (nameMatchScore(query, name) > 0) return true;
+  return bigramDice(coreName(query), coreName(name)) >= 0.34;
+}
+
+function haversineKm(
+  aLat: number,
+  aLng: number,
+  bLat: number,
+  bLng: number,
+): number {
+  const R = 6371;
+  const dLat = ((bLat - aLat) * Math.PI) / 180;
+  const dLng = ((bLng - aLng) * Math.PI) / 180;
+  const s =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((aLat * Math.PI) / 180) *
+      Math.cos((bLat * Math.PI) / 180) *
+      Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+const KIND_BASE: Record<string, number> = {
+  "駅": 40,
+  "バス停": 40,
+  "スポット": 20,
+  "地点": 10,
+  "住所": 5,
+};
+
+function scoreCandidate(
+  c: Omit<PlaceCandidate, "score">,
+  query: string,
+  sourceBonus: number,
+  near: { lat: number; lng: number } | null,
+): PlaceCandidate {
+  let score =
+    (KIND_BASE[c.kind] ?? 0) + nameMatchScore(query, c.name) + sourceBonus;
+  if (near) {
+    score -= Math.min(25, haversineKm(near.lat, near.lng, c.lat, c.lng) * 0.2);
+  }
+  return { ...c, score };
+}
+
+async function searchHeartRails(
+  query: string,
+  near: { lat: number; lng: number } | null,
+): Promise<PlaceCandidate[]> {
+  const core = coreName(query);
+  if (!core) return [];
+  const url =
+    "https://express.heartrails.com/api/json?method=getStations&name=" +
+    encodeURIComponent(core);
+  const j = (await fetchJson(url)) as {
+    response?: {
+      station?: Array<{
+        name?: string;
+        prefecture?: string;
+        line?: string;
+        x?: number | string;
+        y?: number | string;
+      }>;
+    };
+  };
+  const stations = j.response?.station ?? [];
+  const groups = new Map<
+    string,
+    { name: string; prefecture: string; lines: string[]; lat: number; lng: number }
+  >();
+  for (const s of stations) {
+    const lat = Number(s.y);
+    const lng = Number(s.x);
+    if (!s.name || !Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    const key = `${s.name}|${lat.toFixed(3)},${lng.toFixed(3)}`;
+    const g = groups.get(key) ?? {
+      name: s.name,
+      prefecture: s.prefecture ?? "",
+      lines: [],
+      lat,
+      lng,
+    };
+    if (s.line && !g.lines.includes(s.line)) g.lines.push(s.line);
+    groups.set(key, g);
+  }
+  return [...groups.values()].map((g) =>
+    scoreCandidate(
+      {
+        name: g.name.endsWith("駅") ? g.name : `${g.name}駅`,
+        address: [g.prefecture, g.lines.join("、")]
+          .filter(Boolean)
+          .join("｜"),
+        lat: g.lat,
+        lng: g.lng,
+        kind: "駅",
+        line: g.lines[0] ?? null,
+      },
+      query,
+      15,
+      near,
+    ),
+  );
+}
+
+interface PhotonFeature {
+  properties?: {
+    name?: string;
+    street?: string;
+    district?: string;
+    city?: string;
+    state?: string;
+    osm_key?: string;
+    osm_value?: string;
+  };
+  geometry?: { coordinates?: [number, number] };
+}
+
+async function searchPhoton(
+  query: string,
+  tags: string[],
+  kind: "駅" | "バス停",
+  near: { lat: number; lng: number } | null,
+): Promise<PlaceCandidate[]> {
+  const core = coreName(query) || query;
+  const params = new URLSearchParams({
+    q: core,
+    limit: "10",
+    bbox: JP_BBOX,
+  });
+  for (const t of tags) params.append("osm_tag", t);
+  if (near) {
+    params.set("lat", String(near.lat));
+    params.set("lon", String(near.lng));
+  }
+  const j = (await fetchJson(
+    `https://photon.komoot.io/api/?${params.toString()}`,
+  )) as { features?: PhotonFeature[] };
+  const out: PlaceCandidate[] = [];
+  for (const f of j.features ?? []) {
+    const p = f.properties ?? {};
+    const coords = f.geometry?.coordinates;
+    if (!p.name || !coords) continue;
+    const [lng, lat] = coords;
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    if (!namePlausible(query, p.name)) continue;
+    const address = [p.street, p.district, p.city, p.state]
+      .filter((v, i, a) => v && a.indexOf(v) === i)
+      .join(" ");
+    out.push(
+      scoreCandidate(
+        {
+          name:
+            kind === "駅" && !p.name.endsWith("駅")
+              ? `${p.name}駅`
+              : p.name,
+          address,
+          lat,
+          lng,
+          kind,
+          line: null,
+        },
+        query,
+        5,
+        near,
+      ),
+    );
+  }
+  return out;
+}
+
+interface NominatimResult {
+  lat: string;
+  lon: string;
+  name?: string;
+  display_name: string;
+  category?: string;
+  class?: string;
+  type?: string;
+}
+
+async function searchNominatim(
+  query: string,
+  near: { lat: number; lng: number } | null,
+  transitOnly: boolean,
+): Promise<PlaceCandidate[]> {
+  const url =
+    "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=12&addressdetails=1&accept-language=ja" +
+    `&viewbox=${JP_BBOX}&bounded=1&q=` +
+    encodeURIComponent(query);
+  const arr = (await fetchJson(url)) as NominatimResult[];
+  const out: PlaceCandidate[] = [];
+  for (const r of arr) {
+    const lat = Number.parseFloat(r.lat);
+    const lng = Number.parseFloat(r.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    const category = r.category ?? r.class;
+    const type = r.type ?? "";
+    // A traffic signal named like the stop is never the place itself.
+    if (category === "highway" && type === "traffic_signals") continue;
+    // Station entrances/exits are noise next to the station itself.
+    if (type === "subway_entrance") continue;
+    const rawName = r.name?.trim() ? r.name : (r.display_name.split(",")[0] ?? "");
+    let kind: string;
+    let name = rawName;
+    if (
+      (category === "railway" &&
+        (type === "station" || type === "tram_stop" || type === "halt")) ||
+      (category === "public_transport" && type === "station") ||
+      (category === "building" && type === "train_station")
+    ) {
+      kind = "駅";
+      if (name && !name.endsWith("駅")) name = `${name}駅`;
+    } else if (
+      (category === "highway" && type === "bus_stop") ||
+      category === "public_transport"
+    ) {
+      kind = "バス停";
+    } else if (category === "tourism" || category === "amenity") {
+      kind = "スポット";
+    } else if (
+      category === "highway" ||
+      category === "building" ||
+      category === "place"
+    ) {
+      kind = "住所";
+    } else {
+      kind = "地点";
+    }
+    if (transitOnly && kind !== "駅" && kind !== "バス停") continue;
+    // Fuzzy hits from a general geocoder are often a different place
+    // with a vaguely similar name; named places must plausibly match
+    // the query. Address results are exempt: there the query IS the
+    // address, not the result's name.
+    if (kind !== "住所" && rawName && !namePlausible(query, rawName)) {
+      continue;
+    }
+    out.push(
+      scoreCandidate(
+        { name, address: r.display_name, lat, lng, kind, line: null },
+        query,
+        0,
+        near,
+      ),
+    );
+  }
+  return out;
+}
+
+async function searchGsi(
+  query: string,
+  near: { lat: number; lng: number } | null,
+): Promise<PlaceCandidate[]> {
+  // The GSI (Geospatial Information Authority of Japan) address search
+  // resolves Japanese addresses down to the 番地 level, which OSM-based
+  // geocoders mostly cannot.
+  const url =
+    "https://msearch.gsi.go.jp/address-search/AddressSearch?q=" +
+    encodeURIComponent(query);
+  const arr = (await fetchJson(url)) as Array<{
+    properties?: { title?: string };
+    geometry?: { coordinates?: [number, number] };
+  }>;
+  const addressLike = /(都|道|府|県|市|区|町|村|丁目|番地|\d)/u.test(query);
+  const core = coreName(query);
+  const out: PlaceCandidate[] = [];
+  for (const r of arr.slice(0, 5)) {
+    const title = r.properties?.title;
+    const coords = r.geometry?.coordinates;
+    if (!title || !coords) continue;
+    const [lng, lat] = coords;
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    // For non-address queries, only keep addresses that actually
+    // contain the queried name (e.g. 金閣寺 → …金閣寺町…).
+    if (!addressLike && (!core || !coreName(title).includes(core))) continue;
+    out.push(
+      scoreCandidate(
+        { name: title, address: title, lat, lng, kind: "住所", line: null },
+        query,
+        8,
+        near,
+      ),
+    );
+  }
+  return out;
+}
+
 const okResponse = z.object({ ok: z.literal(true)});
 type OkResponse = z.infer<typeof okResponse>;
 
@@ -448,8 +810,12 @@ return { ok: true};
 
 searchPlaces: defineAction({
 description:
-"Searches places by spot name or address (OpenStreetMap/Nominatim) so a point on a route can be registered without typing coordinates. Returns display name, address, and internal coordinates for each candidate.",
-request: z.object({ query: z.string().min(1).max(120)}),
+"Searches places by spot name or address so a point on a route can be registered without typing coordinates. Railway stations come from the HeartRails station database (with line names), stations and bus stops also from tag-filtered OpenStreetMap/Photon, and spots/addresses from Nominatim bounded to Japan; results are merged, deduped, and ranked with stations and bus stops first. Optional nearLat/nearLng bias ranking toward a known nearby point (e.g. the previous spot on the route).",
+request: z.object({
+query: z.string().min(1).max(120),
+nearLat: z.number().min(-90).max(90).nullable().optional(),
+nearLng: z.number().min(-180).max(180).nullable().optional(),
+}),
 response: z.object({
 places: z.array(
 z.object({
@@ -458,66 +824,71 @@ address: z.string(),
 lat: z.number(),
 lng: z.number(),
 kind: z.string(),
+line: z.string().nullable(),
 }),
 ),
 }),
 async handler(_ctx, args) {
-const empty = { places: [] as {
-name: string;
-address: string;
-lat: number;
-lng: number;
-kind: string;
-}[]};
+const query = args.query.trim();
+const near =
+args.nearLat != null && args.nearLng != null
+? { lat: args.nearLat, lng: args.nearLng }
+: null;
+const settled = await Promise.allSettled([
+searchHeartRails(query, near),
+searchPhoton(
+query,
+["railway:station", "railway:tram_stop", "building:train_station"],
+"駅",
+near,
+),
+searchPhoton(query, ["highway:bus_stop"], "バス停", near),
+searchNominatim(query, near, false),
+searchGsi(query, near),
+]);
+let all: PlaceCandidate[] = [];
+for (const s of settled) {
+if (s.status === "fulfilled") all = all.concat(s.value);
+}
+// Bus stops are the weakest-covered kind: if none surfaced and the
+// query did not already say バス停, retry Nominatim with the word
+// appended — its tokenizer only then restricts to bus_stop features.
+if (
+!all.some((c) => c.kind === "バス停") &&
+!query.includes("バス停")
+) {
 try {
-const url =
-"https://nominatim.openstreetmap.org/search?format=jsonv2&limit=6&addressdetails=1&accept-language=ja&q=" +
-encodeURIComponent(args.query);
-const res = await fetch(url, {
-headers: {
-"User-Agent": "MuseTransitGuide/1.0 (personal transit artifact)",
-},
-});
-if (!res.ok) return empty;
-const arr = (await res.json()) as Array<{
-lat: string;
-lon: string;
-name?: string;
-display_name: string;
-category?: string;
-class?: string;
-type?: string;
-}>;
-const seen = new Set<string>();
-const places: typeof empty.places = [];
-for (const r of arr) {
-const lat = Number.parseFloat(r.lat);
-const lng = Number.parseFloat(r.lon);
-if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
-const key = `${lat.toFixed(4)},${lng.toFixed(4)}`;
-if (seen.has(key)) continue;
-seen.add(key);
-const category = r.category?? r.class;
-const kind =
-category === "railway" && r.type === "station"
-? "駅"
-: category === "tourism" || category === "amenity"
-? "スポット"
-: category === "highway" || category === "building" || category === "place"
-? "住所"
-: "地点";
-places.push({
-name: r.name?.trim() ? r.name : r.display_name.split(",")[0] ?? "",
-address: r.display_name,
-lat,
-lng,
-kind,
-});
-}
-return { places};
+const extra = await searchNominatim(`${query} バス停`, near, true);
+all = all.concat(extra);
 } catch {
-return empty;
+// keep what we have
 }
+}
+const byKey = new Map<string, PlaceCandidate>();
+for (const c of all) {
+const key = `${c.name}|${c.lat.toFixed(3)},${c.lng.toFixed(3)}`;
+const prev = byKey.get(key);
+if (!prev) {
+byKey.set(key, c);
+} else {
+byKey.set(key, {
+...(c.score > prev.score ? c : prev),
+line: prev.line ?? c.line,
+});
+}
+}
+const places = [...byKey.values()]
+.sort((a, b) => b.score - a.score)
+.slice(0, 10)
+.map((c) => ({
+name: c.name,
+address: c.address,
+lat: c.lat,
+lng: c.lng,
+kind: c.kind,
+line: c.line,
+}));
+return { places };
 },
 }),
 

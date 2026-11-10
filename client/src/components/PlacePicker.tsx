@@ -14,6 +14,8 @@ export interface PlaceValue {
   address: string;
   lat: number | null;
   lng: number | null;
+  /** Line name when the place was picked from a station candidate. */
+  line?: string | null;
 }
 
 export const emptyPlace = (name = ""): PlaceValue => ({
@@ -29,6 +31,7 @@ interface Candidate {
   lat: number;
   lng: number;
   kind: string;
+  line: string | null;
 }
 
 type MapHandle = {
@@ -45,11 +48,15 @@ export function PlacePicker({
   namePlaceholder,
   value,
   onChange,
+  near,
 }: {
   label: string;
   namePlaceholder?: string;
   value: PlaceValue;
   onChange: (v: PlaceValue) => void;
+  /** A known nearby point (e.g. the previous spot on the route); search
+   * results are biased toward it so same-named stations rank right. */
+  near?: { lat: number; lng: number } | null;
 }) {
   const [query, setQuery] = useState("");
   const [searching, setSearching] = useState(false);
@@ -66,7 +73,13 @@ export function PlacePicker({
     if (!q || searching) return;
     setSearching(true);
     try {
-      const res = await api.searchPlaces({ query: q });
+      const bias =
+        value.lat != null && value.lng != null
+          ? { nearLat: value.lat, nearLng: value.lng }
+          : near
+            ? { nearLat: near.lat, nearLng: near.lng }
+            : {};
+      const res = await api.searchPlaces({ query: q, ...bias });
       setCandidates(res.places);
       setSearched(true);
     } catch {
@@ -83,6 +96,7 @@ export function PlacePicker({
       address: c.address,
       lat: c.lat,
       lng: c.lng,
+      line: c.line,
     });
   };
 
@@ -171,6 +185,7 @@ export function PlacePicker({
                 address: c.address,
                 lat: c.lat,
                 lng: c.lng,
+                line: c.line,
               });
             }
           },
@@ -251,7 +266,7 @@ export function PlacePicker({
               void doSearch();
             }
           }}
-          placeholder="例: 金閣寺 / 京都市北区金閣寺町1"
+          placeholder="例: 金閣寺 / 四条烏丸 / 出町柳"
         />
         <button
           type="button"
@@ -298,7 +313,7 @@ export function PlacePicker({
       )}
       {searched && candidates.length === 0 && !searching && (
         <p className="mt-1.5 text-xs text-[var(--warn)]">
-          候補が見つかりませんでした。住所を詳しく入力するか、地図・現在地から登録してください。
+          候補が見つかりませんでした。駅名・バス停名だけでも探せます。見つからない場合は住所を詳しく入力するか、地図・現在地から登録してください。
         </p>
       )}
 

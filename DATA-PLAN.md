@@ -12,6 +12,41 @@
 **Sample output**: result[0] = name `金閣寺`, display_name `金閣寺, 金閣寺町, 馬喰町, 北区, 京都市, 京都府, 603-8361, 日本`, lat 35.0395293, lon 135.7295373, class amenity / type place_of_worship. Same endpoint family the hotel artifact already uses server-side.
 **Processing**: candidates (name / address / internal lat,lng / kind 駅・スポット・住所・地点） are shown for the user to tap; coordinates are stored internally on the segment (`lat/lng` = start point, `to_lat/to_lng` = end point, plus place names/addresses) and never displayed or typed. Map pinning uses the bundled Meta map control (`hatch-maps.js` copied into `client/src/assets/`, `map_helpers.mjs`): search candidates appear as numbered pins and tapping a pin registers that place; the control's public API exposes no arbitrary-tap coordinate readout, so free-form pin drops are not offered. Reverse geocoding names a point picked from the current GPS position.
 
+## Station / bus-stop search overhaul (edit 2026-11-10)
+- User report (verbatim in the edit brief): 「駅やバス停の検索性が悪すぎる。」
+- Diagnosis (tested 2026-11-10): the old `searchPlaces` was a single unbounded Nominatim free-text query, limit 6. Measured failures: `新宿駅` → administrative areas in China/Brazil/Mongolia, then station entrances （出入口） instead of the station; `金閣寺前` (Kyoto City Bus stop) → a traffic signal of the same name; bus stops classified as 住所 (highway catch-all); no Japan bounding, no name-match filtering, no dedupe beyond exact coordinates.
+- Fix: `searchPlaces` now fans out in parallel and merges with name scoring (exact > prefix > contains > bigram-Dice ≥ 0.34 for fuzzy sources), dedupe by name + ~100 m, stations/bus stops ranked first, optional `nearLat/nearLng` bias (the picker passes the chained previous spot's coordinates from RouteEditor). If no bus stop surfaces and the query lacks バス停, one extra Nominatim pass with ` バス停` appended runs (its tokenizer only then restricts to bus_stop features). Station candidates carry a `line`, and RouteEditor auto-fills an empty 路線名 when a station candidate is picked.
+- Verified via the built action: `新宿駅` → 新宿駅 grouped per operator with line names (was: foreign cities); `出町柳` → 京阪本線/叡山電鉄本線 stations, then 出町柳駅前 bus stops; `四条烏丸` → the actual intersection bus stops; `金閣寺前` → 金閣寺道 bus stop (the real stop serving 金閣寺; the exact-name stop is absent from OSM); `京都市北区金閣寺町1` / `東京都新宿区西新宿1-1-1` → exact 番地-level addresses (GSI).
+
+### HeartRails Express station search (new)
+**Used by**: `searchPlaces` (railway station candidates + line names)
+**Endpoint**: `https://express.heartrails.com/api/json?method=getStations&name=<name without 駅>`
+**Test**: `curl 'https://express.heartrails.com/api/json?method=getStations&name=出町柳'` → 京阪本線/叡山電鉄本線 entries with x/y coordinates, prefecture, prev/next stations. `name=新宿` → per-line entries at the same coordinates (grouped client-side by name + ~100 m).
+
+### Photon (OSM autocomplete), tag-filtered (new)
+**Used by**: `searchPlaces` (station + bus-stop candidates)
+**Endpoint**: `https://photon.komoot.io/api/?q=<name>&limit=10&bbox=124.0,24.0,146.0,45.5&osm_tag=railway:station&osm_tag=railway:tram_stop&osm_tag=building:train_station` and `&osm_tag=highway:bus_stop`
+**Test**: `q=新宿&osm_tag=railway:station` → 新宿 station nodes per operator; `q=金閣寺前&osm_tag=highway:bus_stop` → 金閣寺道 (Kyoto) among fuzzy matches — fuzzy results are name-plausibility-filtered before merging.
+
+### GSI address search (new)
+**Used by**: `searchPlaces` （番地-level Japanese addresses, which Nominatim cannot resolve: `京都市北区金閣寺町1` and `東京都新宿区西新宿1-1-1` both return [] from Nominatim)
+**Endpoint**: `https://msearch.gsi.go.jp/address-search/AddressSearch?q=<address>`
+**Test**: `q=京都市北区金閣寺町1` → `京都府京都市北区金閣寺町１番地` at [135.729279, 35.039619].
+
+### Nominatim changes
+Same endpoint as below, now `viewbox=124.0,24.0,146.0,46.0&bounded=1` (Japan only), limit 12; `traffic_signals` and `subway_entrance` results dropped; kind mapping extended （バス停 for highway/bus_stop + public_transport, 駅 for railway station/tram_stop/halt + building/train_station).
+
+### Rejected: Overpass API name search
+**Test**: exact-name QL queries for 金閣寺前/四条烏丸/出町柳駅 against overpass-api.de and overpass.kumi.systems, plus an area-scoped regex variant — every attempt timed out (>40 s per host; regex area scan >120 s total). Too slow/unreliable for an interactive picker.
+
+## Chained spots in the route editor (edit 2026-11-10)
+- User request (verbatim in the edit brief): in route registration, only the first spot should need manual entry; from the second spot on, the previous spot must automatically become the departure point. Previously the first segment added after the origin was NOT pre-filled (the origin's spot lives in `place`, but `add()` read the previous segment's `toPlace`), and editing a spot did not propagate to the adjoining segment.
+- Fix (client-only, `RouteEditor.tsx`): segments are one continuous chain. `endPlaceOf()` treats the origin's spot as its end; `add()` pre-fills the new segment's start from it; place edits are chain-aware (`setStartPlace`/`setEndPlace` rewrite the neighboring segment's matching end); reorder/removal re-links via `rechain()`. No schema or server change.
+
+## Chained start spots are display-only (edit 2026-11-10)
+- User request (verbatim in the edit brief): since the departure spot is now auto-filled (chained), the place-registration fields for the second and later spots are unnecessary.
+- Change (client-only, `RouteEditor.tsx`): walk segments no longer render a full PlacePicker for 出発地 and ride segments none for 乗車駅 — the chained start spot is shown read-only (name, address, 地点登録済み badge) with a note that it comes from the previous spot and is changed by editing the previous segment's end. Full pickers remain only where a new spot is actually registered: the origin and each segment's end （到着地 / 降車駅）. Because a ride segment's boarding station can no longer be picked directly, picking a station candidate as the previous segment's end now also fills the following ride segment's empty 路線名 (as does adding a ride segment after a station end spot). No schema or server change.
+
 ## Direction unification (edit)
 - Schema: migration 0003 adds place fields + `to_lat/to_lng` + `departures_return` to `segments`, and `direction`/`direction_source` to `app_settings`. One route is bidirectional: places/stations/walk times/ride times are shared; only ride timetables may differ per direction (return timetable optional, falls back to the outbound one).
 - Client: `reversedRoute()` builds the return view (segment ids preserved, so pace learning applies both ways); `detectDirection()` auto-detects from GPS — movement along the route first, then proximity to either end (within 800 m, and only when within 3 km of the route polyline). Detection runs on the board's continuous GPS watch and persists via `setDirection`. A small correction link （行きに切り替え/帰りに切り替え） is the only manual control; a manual correction is stored with source `manual` and auto-detection does not override it (「自動判定に戻す」 releases it).
