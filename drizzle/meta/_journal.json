@@ -15,6 +15,13 @@
       "when": 1794275002330,
       "tag": "0002_transit_tables_replace_entries",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1794284422276,
+      "tag": "0003_places_and_direction_unification",
+      "breakpoints": true
     }
   ]
 }

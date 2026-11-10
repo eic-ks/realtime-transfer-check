@@ -35,6 +35,21 @@ export const segments = sqliteTable("segments", {
   departures: text("departures"),
   lat: real("lat"),
   lng: real("lng"),
+  // Place registration (address / spot-name search / map pin). Coordinates
+  // are internal only — the UI never shows raw latitude/longitude.
+  // placeName/placeAddress describe the segment's start point (origin
+  // place / boarding station); toPlace* the end point (destination /
+  // alighting station). For walk segments these hold the from/to places.
+  placeName: text("place_name"),
+  placeAddress: text("place_address"),
+  toPlaceName: text("to_place_name"),
+  toPlaceAddress: text("to_place_address"),
+  toLat: real("to_lat"),
+  toLng: real("to_lng"),
+  // Return-direction timetable for ride segments, same JSON shape as
+  // `departures`. Routes are bidirectional: one route covers both the
+  // outward and the return trip; only the timetable differs per direction.
+  departuresReturn: text("departures_return"),
 });
 
 export const walkLogs = sqliteTable("walk_logs", {
@@ -66,4 +81,9 @@ export const lineStatus = sqliteTable("line_status", {
 export const appSettings = sqliteTable("app_settings", {
   id: integer("id").primaryKey(),
   activeRouteId: integer("active_route_id"),
+  // Travel direction on the active (bidirectional) route, auto-detected
+  // from GPS position/movement. "manual" source marks a user correction
+  // that auto-detection must not override for the rest of the session.
+  direction: text("direction", { enum: ["outbound", "return"] }),
+  directionSource: text("direction_source"),
 });

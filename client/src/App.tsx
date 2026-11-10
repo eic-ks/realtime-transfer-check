@@ -4,13 +4,17 @@ import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
 import {
 computePlans,
+detectDirection,
 effectiveDelayMin,
 fmtCountdown,
 fmtTime,
 haversineM,
 nowJst,
+reversedRoute,
+routePoints,
 walkMinutes,
 type DayType,
+type Direction,
 type PlanOption,
 } from "./lib/predict";
 import {
@@ -71,6 +75,15 @@ export function App() {
 
   const setActiveMut = useMutation({
     mutationFn: (id: number) => api.setActiveRoute({ id }),
+    onSuccess: invalidate,
+  });
+  const setDirectionMut = useMutation({
+    mutationFn: (args: { direction: Direction; source: "gps" | "manual" }) =>
+      api.setDirection(args),
+    onSuccess: invalidate,
+  });
+  const clearDirectionMut = useMutation({
+    mutationFn: () => api.clearDirection({}),
     onSuccess: invalidate,
   });
   const deleteRouteMut = useMutation({
@@ -204,6 +217,12 @@ export function App() {
           <BoardView
             data={data}
             activeRoute={activeRoute}
+            direction={data.direction}
+            directionSource={data.directionSource}
+            onDirection={(direction, source) =>
+              setDirectionMut.mutate({ direction, source })
+            }
+            onClearDirection={() => clearDirectionMut.mutate()}
             onSelectRoute={(id) => setActiveMut.mutate(id)}
             refreshingLine={refreshingLine}
             refreshNote={refreshNote}
@@ -246,6 +265,10 @@ export function App() {
 function BoardView({
   data,
   activeRoute,
+  direction,
+  directionSource,
+  onDirection,
+  onClearDirection,
   onSelectRoute,
   refreshingLine,
   refreshNote,
@@ -255,6 +278,10 @@ function BoardView({
 }: {
   data: State;
   activeRoute: Route | null;
+  direction: Direction | null;
+  directionSource: string | null;
+  onDirection: (direction: Direction, source: "gps" | "manual") => void;
+  onClearDirection: () => void;
   onSelectRoute: (id: number) => void;
   refreshingLine: string | null;
   refreshNote: { line: string; ok: boolean; message: string } | null;
@@ -269,13 +296,84 @@ function BoardView({
   const [selectedOption, setSelectedOption] = useState(0);
   const [gps, setGps] = useState<{ lat: number; lng: number } | null>(null);
   const [gpsNote, setGpsNote] = useState<string | null>(null);
+  // Direction: manual correction wins; then the server-stored detection;
+  // then a local GPS detection made before the server round-trip lands.
+  const [manualDir, setManualDir] = useState<Direction | null>(null);
+  const [localDir, setLocalDir] = useState<{
+    direction: Direction;
+    reason: string;
+  } | null>(null);
+  const [detectReason, setDetectReason] = useState<string | null>(null);
+  const prevGpsRef = useRef<{ lat: number; lng: number } | null>(null);
+  const gpsDirRef = useRef<Direction | null>(null);
+
+  const dir: Direction =
+    manualDir ??
+    (directionSource === "manual" ? direction : null) ??
+    localDir?.direction ??
+    direction ??
+    "outbound";
+  const isManualDir = manualDir != null || directionSource === "manual";
+
+  const displayRoute: Route | null = useMemo(() => {
+    if (!activeRoute) return null;
+    return dir === "return" ? reversedRoute(activeRoute) : activeRoute;
+  }, [activeRoute, dir]);
 
   useEffect(() => {
     setPositionIdx(0);
     setSelectedOption(0);
     setGps(null);
     setGpsNote(null);
+    setManualDir(null);
+    setLocalDir(null);
+    setDetectReason(null);
+    prevGpsRef.current = null;
+    gpsDirRef.current = null;
   }, [activeRoute?.id]);
+
+  useEffect(() => {
+    setPositionIdx(0);
+    setSelectedOption(0);
+  }, [dir]);
+
+  // Keep watching the position while the board is open: direction
+  // detection and the walking correction both feed off it, so the user
+  // never has to tell the app where they are or which way they travel.
+  useEffect(() => {
+    if (!activeRoute || !("geolocation" in navigator)) return;
+    const watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        setGps({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+      },
+      () => {
+        // Permission denied etc.: the manual controls remain available.
+      },
+      { enableHighAccuracy: true, maximumAge: 15000, timeout: 20000 },
+    );
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, [activeRoute?.id]);
+
+  // Auto-detect direction from each new GPS fix (unless the user has
+  // corrected it manually — their correction sticks).
+  useEffect(() => {
+    if (!gps || !activeRoute || isManualDir) {
+      prevGpsRef.current = gps;
+      return;
+    }
+    const det = detectDirection(activeRoute, prevGpsRef.current, gps);
+    prevGpsRef.current = gps;
+    if (!det) return;
+    if (gpsDirRef.current === det.direction) return;
+    const wasFirst = gpsDirRef.current == null;
+    gpsDirRef.current = det.direction;
+    setLocalDir(det);
+    setDetectReason(det.reason);
+    if (wasFirst || det.direction !== dir) {
+      onDirection(det.direction, "gps");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gps, activeRoute?.id]);
 
   const statuses = useMemo(() => {
     const map = new Map<string, LineStatusRow>();
@@ -286,13 +384,13 @@ function BoardView({
   // GPS correction: replace the first walk (origin -> boarding station)
   // with the remaining fraction implied by the straight-line distance.
   const gpsInfo = useMemo(() => {
-    if (!gps || !activeRoute) return null;
-    const origin = activeRoute.segments[0];
-    const walkIdx = activeRoute.segments.findIndex(
+    if (!gps || !displayRoute) return null;
+    const origin = displayRoute.segments[0];
+    const walkIdx = displayRoute.segments.findIndex(
       (s, i) => i >= positionIdx && s.type === "walk",
     );
-    const walk = walkIdx >= 0 ? activeRoute.segments[walkIdx] : undefined;
-    const ride = activeRoute.segments.find(
+    const walk = walkIdx >= 0 ? displayRoute.segments[walkIdx] : undefined;
+    const ride = displayRoute.segments.find(
       (s, i) => i > walkIdx && s.type === "ride",
     );
     if (!origin || !walk || !ride) return null;
@@ -313,20 +411,20 @@ function BoardView({
       correctedMin: Math.max(1, Math.round(base * ratio * 2) / 2),
       station: ride.station ?? ride.toLabel,
     };
-  }, [gps, activeRoute, positionIdx]);
+  }, [gps, displayRoute, positionIdx]);
 
   const planRoute: Route | null = useMemo(() => {
-    if (!activeRoute) return null;
-    if (!gpsInfo) return activeRoute;
+    if (!displayRoute) return null;
+    if (!gpsInfo) return displayRoute;
     return {
-      ...activeRoute,
-      segments: activeRoute.segments.map((s) =>
+      ...displayRoute,
+      segments: displayRoute.segments.map((s) =>
         s.id === gpsInfo.walkSegmentId
           ? { ...s, learnedWalkMin: gpsInfo.correctedMin }
           : s,
       ),
     };
-  }, [activeRoute, gpsInfo]);
+  }, [displayRoute, gpsInfo]);
 
   const plan = useMemo(() => {
     if (!planRoute) return null;
@@ -347,8 +445,18 @@ function BoardView({
     setGpsNote("位置情報を取得中…");
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        setGps({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        const fix = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        setGps(fix);
         setGpsNote(null);
+        if (activeRoute && !isManualDir) {
+          const det = detectDirection(activeRoute, null, fix);
+          if (det) {
+            gpsDirRef.current = det.direction;
+            setLocalDir(det);
+            setDetectReason(det.reason);
+            onDirection(det.direction, "gps");
+          }
+        }
       },
       () => setGpsNote("位置情報を取得できませんでした"),
       { enableHighAccuracy: true, timeout: 10000 },
@@ -374,15 +482,16 @@ function BoardView({
     );
   }
 
+  const shownRoute = displayRoute ?? activeRoute;
   const lines = [
     ...new Set(
-      activeRoute.segments
+      shownRoute.segments
         .filter((s) => s.type === "ride" && s.line)
         .map((s) => s.line as string),
     ),
   ];
   const positions: { idx: number; label: string }[] = [];
-  activeRoute.segments.forEach((s, i) => {
+  shownRoute.segments.forEach((s, i) => {
     if (s.type === "ride" || i === 0) {
       positions.push({
         idx: i,
@@ -397,9 +506,14 @@ function BoardView({
   });
   const main: PlanOption | undefined =
     plan.options[selectedOption] ?? plan.options[0];
-  const firstRideSeg = activeRoute.segments.find(
+  const firstRideSeg = shownRoute.segments.find(
     (s) => s.id === plan.firstRideSegmentId,
   );
+  const routeEnds = routePoints(activeRoute);
+  const endA = routeEnds[0];
+  const endB = routeEnds[routeEnds.length - 1];
+  const fromEnd = dir === "return" ? endB : endA;
+  const toEnd = dir === "return" ? endA : endB;
   const firstRideStatus = firstRideSeg?.line
     ? statuses.get(firstRideSeg.line)
     : undefined;
@@ -427,6 +541,58 @@ function BoardView({
         ))}
       </div>
 
+      {/* 方向（自動判定・訂正のみ手動） */}
+      <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1">
+        {fromEnd && toEnd ? (
+          <p className="text-sm font-bold">
+            {fromEnd.label} <span className="text-[var(--dim)]">→</span>{" "}
+            {toEnd.label}
+            <span className="ml-2 rounded bg-[#123c26] px-1.5 py-0.5 text-[11px] font-bold text-[#4ade80]">
+              {dir === "return" ? "帰り" : "行き"}で表示中
+            </span>
+          </p>
+        ) : (
+          <p className="text-sm font-bold">
+            <span className="rounded bg-[#123c26] px-1.5 py-0.5 text-[11px] font-bold text-[#4ade80]">
+              {dir === "return" ? "帰り" : "行き"}で表示中
+            </span>
+          </p>
+        )}
+        <span className="text-[11px] text-[var(--dim)]">
+          {isManualDir
+            ? "方向はあなたの指定で固定中"
+            : detectReason
+              ? `自動判定: ${detectReason}`
+              : "方向は現在地から自動判定します"}
+        </span>
+        <button
+          type="button"
+          className="text-[11px] font-bold text-[var(--dim)] underline"
+          onClick={() => {
+            const next: Direction = dir === "return" ? "outbound" : "return";
+            setManualDir(next);
+            onDirection(next, "manual");
+          }}
+        >
+          {dir === "return" ? "行きに切り替え" : "帰りに切り替え"}
+        </button>
+        {isManualDir && (
+          <button
+            type="button"
+            className="text-[11px] font-bold text-[var(--dim)] underline"
+            onClick={() => {
+              setManualDir(null);
+              gpsDirRef.current = null;
+              setLocalDir(null);
+              setDetectReason(null);
+              prevGpsRef.current = null;
+              onClearDirection();
+            }}
+          >
+            自動判定に戻す
+          </button>
+        )}
+      </div>
       {/* 日種と現在地 */}
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <span className="tnum flex items-center gap-1 text-sm text-[var(--dim)]">
@@ -505,7 +671,7 @@ function BoardView({
         )}
         {gps && !gpsInfo && (
           <p className="mt-1.5 text-xs text-[var(--dim)]">
-            補正には出発地点と乗車駅の緯度・経度の登録が必要です（経路の編集から入力できます）。
+            補正には出発地点と乗車駅の地点登録が必要です（経路の編集で、スポット名や住所から登録できます）。
             <button
               type="button"
               className="ml-1 underline"
@@ -871,9 +1037,9 @@ function RoutesView({
 
   const startCreate = () => {
     const origin = newDraftSegment("origin");
-    origin.toLabel = "自宅";
+    origin.place.name = "自宅";
     const walk = newDraftSegment("walk");
-    walk.fromLabel = "自宅";
+    walk.place.name = "自宅";
     const ride = newDraftSegment("ride");
     const walk2 = newDraftSegment("walk");
     setEditing({

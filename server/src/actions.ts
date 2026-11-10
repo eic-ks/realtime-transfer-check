@@ -33,6 +33,14 @@ departuresWeekday: z.array(z.number()),
 departuresHoliday: z.array(z.number()),
 lat: z.number().nullable(),
 lng: z.number().nullable(),
+placeName: z.string().nullable(),
+placeAddress: z.string().nullable(),
+toPlaceName: z.string().nullable(),
+toPlaceAddress: z.string().nullable(),
+toLat: z.number().nullable(),
+toLng: z.number().nullable(),
+returnWeekday: z.array(z.number()),
+returnHoliday: z.array(z.number()),
 learnedWalkMin: z.number().nullable(),
 walkSamples: z.number(),
 });
@@ -57,6 +65,8 @@ fetchedAt: z.string().nullable(),
 
 const stateResponse = z.object({
 activeRouteId: z.number().nullable(),
+direction: z.enum(["outbound", "return"]).nullable(),
+directionSource: z.string().nullable(),
 routes: z.array(routeShape),
 lineStatuses: z.array(lineStatusShape),
 walkLogs: z.array(
@@ -84,6 +94,13 @@ rideMin: z.number().int().min(0).max(600).nullable(),
 departures: departuresShape.nullable(),
 lat: z.number().min(-90).max(90).nullable(),
 lng: z.number().min(-180).max(180).nullable(),
+placeName: z.string().max(120).nullable(),
+placeAddress: z.string().max(300).nullable(),
+toPlaceName: z.string().max(120).nullable(),
+toPlaceAddress: z.string().max(300).nullable(),
+toLat: z.number().min(-90).max(90).nullable(),
+toLng: z.number().min(-180).max(180).nullable(),
+departuresReturn: departuresShape.nullable(),
 });
 
 // ---------- helpers ----------
@@ -138,6 +155,8 @@ const list = logsBySegment.get(log.segmentId) ?? [];
 if (list.length < 10) list.push({ plannedMin: log.plannedMin, actualMin: log.actualMin });
 logsBySegment.set(log.segmentId, list);
 }
+// Learned pace is direction-independent: a walk segment A⇔B shares its
+// logs whichever way the user walks it.
 const learnedBySegment = new Map<
 number,
 { learned: number | null; samples: number}
@@ -165,6 +184,7 @@ segments: segmentRows
 .filter((s) => s.routeId === route.id)
 .map((s) => {
 const deps = parseDepartures(s.departures);
+const retDeps = parseDepartures(s.departuresReturn);
 const learning = learnedBySegment.get(s.id);
 const learnedWalkMin =
 s.type === "walk" &&
@@ -187,6 +207,14 @@ departuresWeekday: deps.weekday,
 departuresHoliday: deps.holiday,
 lat: s.lat,
 lng: s.lng,
+placeName: s.placeName,
+placeAddress: s.placeAddress,
+toPlaceName: s.toPlaceName,
+toPlaceAddress: s.toPlaceAddress,
+toLat: s.toLat,
+toLng: s.toLng,
+returnWeekday: retDeps.weekday,
+returnHoliday: retDeps.holiday,
 learnedWalkMin,
 walkSamples: learning?.samples?? 0,
 };
@@ -199,6 +227,8 @@ setting?.activeRouteId!= null &&
 routes.some((r) => r.id === setting.activeRouteId)
 ? setting.activeRouteId
 : (routes[0]?.id?? null),
+direction: setting?.direction?? null,
+directionSource: setting?.directionSource?? null,
 routes,
 lineStatuses: statusRows.map((row) => ({
 line: row.line,
@@ -282,6 +312,15 @@ rideMin: seg.rideMin,
 departures: seg.departures? JSON.stringify(seg.departures): null,
 lat: seg.lat,
 lng: seg.lng,
+placeName: seg.placeName,
+placeAddress: seg.placeAddress,
+toPlaceName: seg.toPlaceName,
+toPlaceAddress: seg.toPlaceAddress,
+toLat: seg.toLat,
+toLng: seg.toLng,
+departuresReturn: seg.departuresReturn
+? JSON.stringify(seg.departuresReturn)
+: null,
 });
 }
 ctx.invalidateQueries();
@@ -311,7 +350,7 @@ await db
 if (setting?.activeRouteId === args.id) {
 await db
 .update(schema.appSettings)
-.set({ activeRouteId: null})
+.set({ activeRouteId: null, direction: null, directionSource: null })
 .where(eq(schema.appSettings.id, 1));
 }
 ctx.invalidateQueries();
@@ -334,7 +373,11 @@ await db
 if (existing) {
 await db
 .update(schema.appSettings)
-.set({ activeRouteId: args.id})
+.set({
+activeRouteId: args.id,
+direction: null,
+directionSource: null,
+})
 .where(eq(schema.appSettings.id, 1));
 } else {
 await db
@@ -343,6 +386,184 @@ await db
 }
 ctx.invalidateQueries();
 return { ok: true};
+},
+}),
+
+setDirection: defineAction({
+description:
+"Stores the detected (or user-corrected) travel direction on the active bidirectional route. Source 'gps' is auto-detection; 'manual' is the user's correction and sticks.",
+request: z.object({
+direction: z.enum(["outbound", "return"]),
+source: z.enum(["gps", "manual"]),
+}),
+response: okResponse,
+async handler(ctx, args): Promise<OkResponse> {
+const db = ctx.db<typeof schema>();
+const existing = (
+await db
+.select()
+.from(schema.appSettings)
+.where(eq(schema.appSettings.id, 1))
+)[0];
+if (existing) {
+await db
+.update(schema.appSettings)
+.set({ direction: args.direction, directionSource: args.source })
+.where(eq(schema.appSettings.id, 1));
+} else {
+await db.insert(schema.appSettings).values({
+id: 1,
+direction: args.direction,
+directionSource: args.source,
+});
+}
+ctx.invalidateQueries();
+return { ok: true};
+},
+}),
+
+clearDirection: defineAction({
+description:
+"Clears the stored travel direction (including a manual correction) so GPS auto-detection takes over again on the next position fix.",
+request: z.object({}),
+response: okResponse,
+async handler(ctx): Promise<OkResponse> {
+const db = ctx.db<typeof schema>();
+const existing = (
+await db
+.select()
+.from(schema.appSettings)
+.where(eq(schema.appSettings.id, 1))
+)[0];
+if (existing) {
+await db
+.update(schema.appSettings)
+.set({ direction: null, directionSource: null })
+.where(eq(schema.appSettings.id, 1));
+}
+ctx.invalidateQueries();
+return { ok: true};
+},
+}),
+
+searchPlaces: defineAction({
+description:
+"Searches places by spot name or address (OpenStreetMap/Nominatim) so a point on a route can be registered without typing coordinates. Returns display name, address, and internal coordinates for each candidate.",
+request: z.object({ query: z.string().min(1).max(120)}),
+response: z.object({
+places: z.array(
+z.object({
+name: z.string(),
+address: z.string(),
+lat: z.number(),
+lng: z.number(),
+kind: z.string(),
+}),
+),
+}),
+async handler(_ctx, args) {
+const empty = { places: [] as {
+name: string;
+address: string;
+lat: number;
+lng: number;
+kind: string;
+}[]};
+try {
+const url =
+"https://nominatim.openstreetmap.org/search?format=jsonv2&limit=6&addressdetails=1&accept-language=ja&q=" +
+encodeURIComponent(args.query);
+const res = await fetch(url, {
+headers: {
+"User-Agent": "MuseTransitGuide/1.0 (personal transit artifact)",
+},
+});
+if (!res.ok) return empty;
+const arr = (await res.json()) as Array<{
+lat: string;
+lon: string;
+name?: string;
+display_name: string;
+category?: string;
+class?: string;
+type?: string;
+}>;
+const seen = new Set<string>();
+const places: typeof empty.places = [];
+for (const r of arr) {
+const lat = Number.parseFloat(r.lat);
+const lng = Number.parseFloat(r.lon);
+if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+const key = `${lat.toFixed(4)},${lng.toFixed(4)}`;
+if (seen.has(key)) continue;
+seen.add(key);
+const category = r.category?? r.class;
+const kind =
+category === "railway" && r.type === "station"
+? "駅"
+: category === "tourism" || category === "amenity"
+? "スポット"
+: category === "highway" || category === "building" || category === "place"
+? "住所"
+: "地点";
+places.push({
+name: r.name?.trim() ? r.name : r.display_name.split(",")[0] ?? "",
+address: r.display_name,
+lat,
+lng,
+kind,
+});
+}
+return { places};
+} catch {
+return empty;
+}
+},
+}),
+
+reverseGeocode: defineAction({
+description:
+"Looks up the nearest named place/address for map-picked coordinates (OpenStreetMap/Nominatim reverse geocoding), so a point dropped on the map gets a human-readable name.",
+request: z.object({
+lat: z.number().min(-90).max(90),
+lng: z.number().min(-180).max(180),
+}),
+response: z.object({
+name: z.string().nullable(),
+address: z.string().nullable(),
+}),
+async handler(_ctx, args) {
+try {
+const url =
+`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&addressdetails=1&accept-language=ja&lat=${args.lat}&lon=${args.lng}`;
+const res = await fetch(url, {
+headers: {
+"User-Agent": "MuseTransitGuide/1.0 (personal transit artifact)",
+},
+});
+if (!res.ok) return { name: null, address: null};
+const j = (await res.json()) as {
+name?: string;
+display_name?: string;
+address?: Record<string, string>;
+};
+const addr = j.address?? {};
+const fallbackName =
+addr.railway ??
+addr.tourism ??
+addr.amenity ??
+addr.building ??
+addr.road ??
+addr.neighbourhood ??
+addr.suburb ??
+"";
+return {
+name: j.name?.trim() ? j.name : fallbackName || null,
+address: j.display_name?? null,
+};
+} catch {
+return { name: null, address: null};
+}
 },
 }),
 

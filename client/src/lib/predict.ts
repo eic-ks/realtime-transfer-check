@@ -6,6 +6,7 @@ export type DayType = "weekday" | "holiday";
 
 export interface SegmentLike {
   id: number;
+  position: number;
   type: "origin" | "walk" | "ride";
   fromLabel: string;
   toLabel: string;
@@ -18,6 +19,14 @@ export interface SegmentLike {
   departuresHoliday: number[];
   lat: number | null;
   lng: number | null;
+  placeName: string | null;
+  placeAddress: string | null;
+  toPlaceName: string | null;
+  toPlaceAddress: string | null;
+  toLat: number | null;
+  toLng: number | null;
+  returnWeekday: number[];
+  returnHoliday: number[];
   learnedWalkMin: number | null;
   walkSamples: number;
 }
@@ -261,6 +270,208 @@ export function computePlans(
     return { ...base, options: opt ? [opt] : [], endOfService: true };
   }
   return { ...base, endOfService: true };
+}
+
+export type Direction = "outbound" | "return";
+
+/** Ordered named points of a route (start → destination), for GPS work. */
+export interface RoutePoint {
+  label: string;
+  lat: number;
+  lng: number;
+}
+
+export function routePoints(route: RouteLike): RoutePoint[] {
+  const pts: RoutePoint[] = [];
+  const push = (label: string, lat: number | null, lng: number | null) => {
+    if (lat == null || lng == null) return;
+    const last = pts[pts.length - 1];
+    if (last && Math.abs(last.lat - lat) < 1e-9 && Math.abs(last.lng - lng) < 1e-9) {
+      return;
+    }
+    pts.push({ label, lat, lng });
+  };
+  for (const seg of route.segments) {
+    if (seg.type === "origin") {
+      push(seg.placeName ?? seg.toLabel, seg.lat, seg.lng);
+    } else if (seg.type === "walk") {
+      push(seg.placeName ?? seg.fromLabel, seg.lat, seg.lng);
+      push(seg.toPlaceName ?? seg.toLabel, seg.toLat, seg.toLng);
+    } else {
+      push(seg.placeName ?? seg.station ?? seg.fromLabel, seg.lat, seg.lng);
+      push(seg.toPlaceName ?? seg.toLabel, seg.toLat, seg.toLng);
+    }
+  }
+  return pts;
+}
+
+/** Distance from a point to the route polyline, in meters (rough). */
+function distToRouteM(
+  pos: { lat: number; lng: number },
+  pts: RoutePoint[],
+): number {
+  if (pts.length === 0) return Number.POSITIVE_INFINITY;
+  let best = Number.POSITIVE_INFINITY;
+  const segDist = (
+    p: { lat: number; lng: number },
+    a: RoutePoint,
+    b: RoutePoint,
+  ): number => {
+    const midLat = ((a.lat + b.lat) / 2) * (Math.PI / 180);
+    const ax = a.lng * Math.cos(midLat);
+    const ay = a.lat;
+    const bx = b.lng * Math.cos(midLat);
+    const by = b.lat;
+    const px = p.lng * Math.cos(midLat);
+    const py = p.lat;
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    const t =
+      len2 === 0
+        ? 0
+        : Math.min(1, Math.max(0, ((px - ax) * dx + (py - ay) * dy) / len2));
+    const cx = ax + t * dx;
+    const cy = ay + t * dy;
+    return haversineM(p, { lat: cy, lng: cx / Math.cos(midLat) });
+  };
+  if (pts.length === 1) {
+    const only = pts[0];
+    return only ? haversineM(pos, only) : best;
+  }
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const a = pts[i];
+    const b = pts[i + 1];
+    if (a && b) best = Math.min(best, segDist(pos, a, b));
+  }
+  return best;
+}
+
+/**
+ * Auto-detect travel direction on a bidirectional route.
+ * Uses where the user is relative to the two ends, confirmed/refined by
+ * how they are moving along the route. Returns null when there is not
+ * enough signal (no registered places, or the user is far from the route).
+ */
+export function detectDirection(
+  route: RouteLike,
+  prev: { lat: number; lng: number } | null,
+  cur: { lat: number; lng: number },
+): { direction: Direction; reason: string } | null {
+  const pts = routePoints(route);
+  if (pts.length < 2) return null;
+  const first = pts[0];
+  const last = pts[pts.length - 1];
+  if (!first || !last) return null;
+  if (distToRouteM(cur, pts) > 3000) return null;
+
+  const movedM = prev ? haversineM(prev, cur) : 0;
+  if (prev && movedM >= 25) {
+    const dFirstPrev = haversineM(prev, first);
+    const dFirstCur = haversineM(cur, first);
+    const dLastPrev = haversineM(prev, last);
+    const dLastCur = haversineM(cur, last);
+    const towardLast = dLastPrev - dLastCur;
+    const towardFirst = dFirstPrev - dFirstCur;
+    if (towardLast > 15 && towardLast >= towardFirst) {
+      return {
+        direction: "outbound",
+        reason: `移動方向から「${last.label}」方面へ進んでいると判定`,
+      };
+    }
+    if (towardFirst > 15 && towardFirst > towardLast) {
+      return {
+        direction: "return",
+        reason: `移動方向から「${first.label}」方面へ進んでいると判定`,
+      };
+    }
+  }
+
+  const dFirst = haversineM(cur, first);
+  const dLast = haversineM(cur, last);
+  const NEAR_M = 800;
+  if (dFirst <= NEAR_M && dLast > NEAR_M) {
+    return {
+      direction: "outbound",
+      reason: `現在地が「${first.label}」付近のため行きと判定`,
+    };
+  }
+  if (dLast <= NEAR_M && dFirst > NEAR_M) {
+    return {
+      direction: "return",
+      reason: `現在地が「${last.label}」付近のため帰りと判定`,
+    };
+  }
+  return null;
+}
+
+/**
+ * Build the reversed view of a bidirectional route (the return trip).
+ * Segment ids are preserved so walking-pace learning applies both ways.
+ */
+export function reversedRoute(route: RouteLike): RouteLike {
+  const segs = route.segments;
+  const lastSeg = segs[segs.length - 1];
+  const originSeg = segs[0];
+  if (!lastSeg || !originSeg || segs.length < 2) return route;
+  const out: SegmentLike[] = [];
+  out.push({
+    ...originSeg,
+    type: "origin",
+    fromLabel: "",
+    toLabel: lastSeg.toPlaceName ?? lastSeg.toLabel,
+    lat: lastSeg.toLat ?? null,
+    lng: lastSeg.toLng ?? null,
+    placeName: lastSeg.toPlaceName ?? null,
+    placeAddress: lastSeg.toPlaceAddress ?? null,
+    toPlaceName: null,
+    toPlaceAddress: null,
+    toLat: null,
+    toLng: null,
+  });
+  for (let i = segs.length - 1; i >= 1; i--) {
+    const seg = segs[i];
+    if (!seg) continue;
+    if (seg.type === "walk") {
+      out.push({
+        ...seg,
+        fromLabel: seg.toLabel,
+        toLabel: seg.fromLabel,
+        lat: seg.toLat ?? null,
+        lng: seg.toLng ?? null,
+        placeName: seg.toPlaceName ?? null,
+        placeAddress: seg.toPlaceAddress ?? null,
+        toPlaceName: seg.placeName ?? null,
+        toPlaceAddress: seg.placeAddress ?? null,
+        toLat: seg.lat ?? null,
+        toLng: seg.lng ?? null,
+      });
+    } else if (seg.type === "ride") {
+      out.push({
+        ...seg,
+        fromLabel: seg.toLabel,
+        toLabel: seg.station ?? seg.fromLabel,
+        station: seg.toLabel,
+        departuresWeekday:
+          seg.returnWeekday.length > 0
+            ? seg.returnWeekday
+            : seg.departuresWeekday,
+        departuresHoliday:
+          seg.returnHoliday.length > 0
+            ? seg.returnHoliday
+            : seg.departuresHoliday,
+        lat: seg.toLat ?? null,
+        lng: seg.toLng ?? null,
+        placeName: seg.toPlaceName ?? null,
+        placeAddress: seg.toPlaceAddress ?? null,
+        toPlaceName: seg.placeName ?? null,
+        toPlaceAddress: seg.placeAddress ?? null,
+        toLat: seg.lat ?? null,
+        toLng: seg.lng ?? null,
+      });
+    }
+  }
+  return { ...route, segments: out };
 }
 
 /** Straight-line distance in meters (haversine). */

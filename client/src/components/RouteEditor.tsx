@@ -1,6 +1,10 @@
-// Route editor: builds one route as an ordered list of segments.
-// Segment 0 is always the origin; walk and ride segments follow.
-// Ride segments carry the user's own timetable text (parsed on save).
+// Route editor: builds one bidirectional route as an ordered list of
+// segments. Segment 0 is always the origin; walk and ride segments follow.
+// One route covers both directions (outbound + return): places, stations
+// and walking times are shared; ride segments may carry an optional
+// return-direction timetable. Points are registered with PlacePicker
+// (spot-name / address search, map pins, current position) — raw
+// coordinates never appear in the UI.
 
 import { useState, type ReactNode } from "react";
 import {
@@ -18,6 +22,7 @@ TrainIcon,
 TrashIcon,
 WalkIcon,
 } from "./icons";
+import { PlacePicker, emptyPlace, type PlaceValue } from "./PlacePicker";
 
 export interface DraftSegment {
   key: number;
@@ -31,8 +36,10 @@ export interface DraftSegment {
   rideMin: string;
   timesWeekday: string;
   timesHoliday: string;
-  lat: string;
-  lng: string;
+  timesReturnWeekday: string;
+  timesReturnHoliday: string;
+  place: PlaceValue;
+  toPlace: PlaceValue;
 }
 
 let keyCounter = 1;
@@ -51,8 +58,10 @@ export function newDraftSegment(
     rideMin: type === "ride" ? "15" : "",
     timesWeekday: "",
     timesHoliday: "",
-    lat: "",
-    lng: "",
+    timesReturnWeekday: "",
+    timesReturnHoliday: "",
+    place: emptyPlace(),
+    toPlace: emptyPlace(),
   };
 }
 
@@ -69,8 +78,26 @@ export function routeToDraft(route: RouteLike): DraftSegment[] {
     rideMin: s.rideMin != null ? String(s.rideMin) : "",
     timesWeekday: formatTimes(s.departuresWeekday),
     timesHoliday: formatTimes(s.departuresHoliday),
-    lat: s.lat != null ? String(s.lat) : "",
-    lng: s.lng != null ? String(s.lng) : "",
+    timesReturnWeekday: formatTimes(s.returnWeekday),
+    timesReturnHoliday: formatTimes(s.returnHoliday),
+    place: {
+      name:
+        s.placeName ??
+        (s.type === "origin"
+          ? s.toLabel
+          : s.type === "ride"
+            ? (s.station ?? s.fromLabel)
+            : s.fromLabel),
+      address: s.placeAddress ?? "",
+      lat: s.lat,
+      lng: s.lng,
+    },
+    toPlace: {
+      name: s.toPlaceName ?? s.toLabel,
+      address: s.toPlaceAddress ?? "",
+      lat: s.toLat,
+      lng: s.toLng,
+    },
   }));
 }
 
@@ -89,12 +116,36 @@ export interface RoutePayload {
     departures: { weekday: number[]; holiday: number[] } | null;
     lat: number | null;
     lng: number | null;
+    placeName: string | null;
+    placeAddress: string | null;
+    toPlaceName: string | null;
+    toPlaceAddress: string | null;
+    toLat: number | null;
+    toLng: number | null;
+    departuresReturn: { weekday: number[]; holiday: number[] } | null;
   }[];
 }
 
 function numOrNull(v: string): number | null {
   const n = Number(v);
   return v.trim() !== "" && Number.isFinite(n) ? n : null;
+}
+
+function placeFields(p: PlaceValue): {
+  name: string | null;
+  address: string | null;
+  lat: number | null;
+  lng: number | null;
+} {
+  if (p.lat == null || p.lng == null) {
+    return { name: null, address: null, lat: null, lng: null };
+  }
+  return {
+    name: p.name.trim() || null,
+    address: p.address.trim() || null,
+    lat: p.lat,
+    lng: p.lng,
+  };
 }
 
 export function draftToPayload(
@@ -110,50 +161,62 @@ export function draftToPayload(
   for (const [i, d] of drafts.entries()) {
     const label = `区間${i + 1}`;
     if (d.type === "origin") {
-      if (!d.toLabel.trim()) {
+      if (!d.place.name.trim()) {
         return { ok: false, error: `${label}: 出発地点名を入力してください` };
       }
-      const lat = numOrNull(d.lat);
-      const lng = numOrNull(d.lng);
-      if ((lat == null) !== (lng == null)) {
-        return { ok: false, error: `${label}: 緯度と経度は両方入力してください` };
-      }
+      const pf = placeFields(d.place);
       segments.push({
         type: "origin",
         fromLabel: "",
-        toLabel: d.toLabel.trim(),
+        toLabel: d.place.name.trim(),
         station: null,
         line: null,
         baseWalkMin: null,
         accessMin: null,
         rideMin: null,
         departures: null,
-        lat,
-        lng,
+        lat: pf.lat,
+        lng: pf.lng,
+        placeName: pf.name,
+        placeAddress: pf.address,
+        toPlaceName: null,
+        toPlaceAddress: null,
+        toLat: null,
+        toLng: null,
+        departuresReturn: null,
       });
     } else if (d.type === "walk") {
-      if (!d.fromLabel.trim() || !d.toLabel.trim()) {
+      if (!d.place.name.trim() || !d.toPlace.name.trim()) {
         return { ok: false, error: `${label}: 徒歩の出発地と到着地を入力してください` };
       }
       const base = numOrNull(d.baseWalkMin);
       if (base == null || base <= 0) {
         return { ok: false, error: `${label}: 徒歩分数（目安）を入力してください` };
       }
+      const pf = placeFields(d.place);
+      const tf = placeFields(d.toPlace);
       segments.push({
         type: "walk",
-        fromLabel: d.fromLabel.trim(),
-        toLabel: d.toLabel.trim(),
+        fromLabel: d.place.name.trim(),
+        toLabel: d.toPlace.name.trim(),
         station: null,
         line: null,
         baseWalkMin: Math.round(base),
         accessMin: null,
         rideMin: null,
         departures: null,
-        lat: null,
-        lng: null,
+        lat: pf.lat,
+        lng: pf.lng,
+        placeName: pf.name,
+        placeAddress: pf.address,
+        toPlaceName: tf.name,
+        toPlaceAddress: tf.address,
+        toLat: tf.lat,
+        toLng: tf.lng,
+        departuresReturn: null,
       });
     } else {
-      if (!d.line.trim() || !d.station.trim() || !d.toLabel.trim()) {
+      if (!d.line.trim() || !d.place.name.trim() || !d.toPlace.name.trim()) {
         return { ok: false, error: `${label}: 路線名・乗車駅・降車駅を入力してください` };
       }
       const weekday = parseTimes(d.timesWeekday);
@@ -167,23 +230,35 @@ export function draftToPayload(
       if (rideMin == null || rideMin <= 0) {
         return { ok: false, error: `${label}: 乗車時間（分）を入力してください` };
       }
-      const lat = numOrNull(d.lat);
-      const lng = numOrNull(d.lng);
-      if ((lat == null) !== (lng == null)) {
-        return { ok: false, error: `${label}: 乗車駅の緯度と経度は両方入力してください` };
-      }
+      const retWeekday = parseTimes(d.timesReturnWeekday);
+      const retHoliday = d.timesReturnHoliday.trim()
+        ? parseTimes(d.timesReturnHoliday)
+        : retWeekday;
+      const departuresReturn =
+        retWeekday.length > 0
+          ? { weekday: retWeekday, holiday: retHoliday }
+          : null;
+      const pf = placeFields(d.place);
+      const tf = placeFields(d.toPlace);
       segments.push({
         type: "ride",
         fromLabel: d.fromLabel.trim(),
-        toLabel: d.toLabel.trim(),
-        station: d.station.trim(),
+        toLabel: d.toPlace.name.trim(),
+        station: d.place.name.trim(),
         line: d.line.trim(),
         baseWalkMin: null,
         accessMin: Math.max(0, Math.round(numOrNull(d.accessMin) ?? 3)),
         rideMin: Math.round(rideMin),
         departures: { weekday, holiday },
-        lat,
-        lng,
+        lat: pf.lat,
+        lng: pf.lng,
+        placeName: pf.name,
+        placeAddress: pf.address,
+        toPlaceName: tf.name,
+        toPlaceAddress: tf.address,
+        toLat: tf.lat,
+        toLng: tf.lng,
+        departuresReturn,
       });
     }
   }
@@ -270,8 +345,10 @@ export function RouteEditor({
     setDrafts((prev) => {
       const draft = newDraftSegment(type);
       const last = prev[prev.length - 1];
-      if (type === "walk" && last) draft.fromLabel = last.toLabel;
-      if (type === "ride" && last) draft.fromLabel = last.toLabel;
+      if (last) {
+        draft.place = { ...last.toPlace };
+        draft.fromLabel = last.toLabel;
+      }
       return [...prev, draft];
     });
   };
@@ -290,10 +367,15 @@ export function RouteEditor({
     const times = generateTimes(first, last, interval);
     if (times.length === 0) return;
     const text = formatTimes(times);
-    update(
-      key,
-      g.target === "holiday" ? { timesHoliday: text } : { timesWeekday: text },
-    );
+    const patch: Partial<DraftSegment> =
+      g.target === "holiday"
+        ? { timesHoliday: text }
+        : g.target === "returnWeekday"
+          ? { timesReturnWeekday: text }
+          : g.target === "returnHoliday"
+            ? { timesReturnHoliday: text }
+            : { timesWeekday: text };
+    update(key, patch);
   };
 
   const handleSave = () => {
@@ -316,7 +398,7 @@ export function RouteEditor({
             className={inputCls}
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="例: 通勤（行き）"
+            placeholder="例: 自宅⇔会社"
           />
         </Field>
         <Field label="余裕（分）">
@@ -332,7 +414,7 @@ export function RouteEditor({
         </Field>
       </div>
       <p className="mt-1 text-xs text-[var(--dim)]">
-        余裕は「ホームに着いてから発車まで」に確保する安全マージンです。
+        行き・帰りは分けず、1つの経路で登録します。どちらの方向かはアプリが現在地から自動で判定します。余裕は「ホームに着いてから発車まで」に確保する安全マージンです。
       </p>
 
       <div className="mt-4 space-y-3">
@@ -389,67 +471,30 @@ export function RouteEditor({
             </div>
 
             {d.type === "origin" && (
-              <div className="mt-2 space-y-2">
-                <Field label="地点名">
-                  <input
-                    aria-label="出発地点名"
-                    className={inputCls}
-                    value={d.toLabel}
-                    onChange={(e) => update(d.key, { toLabel: e.target.value })}
-                    placeholder="例: 自宅"
-                  />
-                </Field>
-                <div className="grid grid-cols-2 gap-2">
-                  <Field label="緯度（任意・現在地補正用）">
-                    <input
-                      aria-label="出発地点の緯度"
-                      className={inputCls}
-                      inputMode="decimal"
-                      value={d.lat}
-                      onChange={(e) => update(d.key, { lat: e.target.value })}
-                      placeholder="35.6812"
-                    />
-                  </Field>
-                  <Field label="経度（任意）">
-                    <input
-                      aria-label="出発地点の経度"
-                      className={inputCls}
-                      inputMode="decimal"
-                      value={d.lng}
-                      onChange={(e) => update(d.key, { lng: e.target.value })}
-                      placeholder="139.7671"
-                    />
-                  </Field>
-                </div>
+              <div className="mt-2">
+                <PlacePicker
+                  label="地点名"
+                  namePlaceholder="例: 自宅"
+                  value={d.place}
+                  onChange={(place) => update(d.key, { place })}
+                />
               </div>
             )}
 
             {d.type === "walk" && (
-              <div className="mt-2 space-y-2">
-                <div className="grid grid-cols-2 gap-2">
-                  <Field label="出発地">
-                    <input
-                      aria-label="徒歩の出発地"
-                      className={inputCls}
-                      value={d.fromLabel}
-                      onChange={(e) =>
-                        update(d.key, { fromLabel: e.target.value })
-                      }
-                      placeholder="例: 自宅"
-                    />
-                  </Field>
-                  <Field label="到着地">
-                    <input
-                      aria-label="徒歩の到着地"
-                      className={inputCls}
-                      value={d.toLabel}
-                      onChange={(e) =>
-                        update(d.key, { toLabel: e.target.value })
-                      }
-                      placeholder="例: 最寄り駅"
-                    />
-                  </Field>
-                </div>
+              <div className="mt-2 space-y-3">
+                <PlacePicker
+                  label="出発地"
+                  namePlaceholder="例: 自宅"
+                  value={d.place}
+                  onChange={(place) => update(d.key, { place })}
+                />
+                <PlacePicker
+                  label="到着地"
+                  namePlaceholder="例: 最寄り駅"
+                  value={d.toPlace}
+                  onChange={(toPlace) => update(d.key, { toPlace })}
+                />
                 <Field label="徒歩分数（目安）">
                   <input
                     aria-label="徒歩分数"
@@ -464,47 +509,35 @@ export function RouteEditor({
                   />
                 </Field>
                 <p className="text-xs text-[var(--dim)]">
-                  実際に歩いた記録がたまると、あなたのペースに合わせて自動で補正されます。
+                  徒歩分数は両方向で共通です。実際に歩いた記録がたまると、あなたのペースに合わせて自動で補正されます。
                 </p>
               </div>
             )}
 
             {d.type === "ride" && (
-              <div className="mt-2 space-y-2">
+              <div className="mt-2 space-y-3">
+                <Field label="路線名">
+                  <input
+                    aria-label="路線名"
+                    className={inputCls}
+                    value={d.line}
+                    onChange={(e) => update(d.key, { line: e.target.value })}
+                    placeholder="例: JR山手線"
+                  />
+                </Field>
+                <PlacePicker
+                  label="乗車駅"
+                  namePlaceholder="例: 新宿"
+                  value={d.place}
+                  onChange={(place) => update(d.key, { place })}
+                />
+                <PlacePicker
+                  label="降車駅"
+                  namePlaceholder="例: 池袋"
+                  value={d.toPlace}
+                  onChange={(toPlace) => update(d.key, { toPlace })}
+                />
                 <div className="grid grid-cols-2 gap-2">
-                  <Field label="路線名">
-                    <input
-                      aria-label="路線名"
-                      className={inputCls}
-                      value={d.line}
-                      onChange={(e) => update(d.key, { line: e.target.value })}
-                      placeholder="例: JR山手線"
-                    />
-                  </Field>
-                  <Field label="乗車駅">
-                    <input
-                      aria-label="乗車駅"
-                      className={inputCls}
-                      value={d.station}
-                      onChange={(e) =>
-                        update(d.key, { station: e.target.value })
-                      }
-                      placeholder="例: 新宿"
-                    />
-                  </Field>
-                </div>
-                <div className="grid grid-cols-3 gap-2">
-                  <Field label="降車駅">
-                    <input
-                      aria-label="降車駅"
-                      className={inputCls}
-                      value={d.toLabel}
-                      onChange={(e) =>
-                        update(d.key, { toLabel: e.target.value })
-                      }
-                      placeholder="例: 池袋"
-                    />
-                  </Field>
                   <Field label="乗車時間（分）">
                     <input
                       aria-label="乗車時間"
@@ -532,7 +565,7 @@ export function RouteEditor({
                     />
                   </Field>
                 </div>
-                <Field label="平日の発車時刻">
+                <Field label="平日の発車時刻（行き）">
                   <textarea
                     aria-label="平日の発車時刻"
                     className={`${inputCls} tnum`}
@@ -544,7 +577,7 @@ export function RouteEditor({
                     placeholder={"7: 02 12 22 32\n8: 02 12"}
                   />
                 </Field>
-                <Field label="土休日の発車時刻（空欄なら平日と同じ）">
+                <Field label="土休日の発車時刻（行き・空欄なら平日と同じ）">
                   <textarea
                     aria-label="土休日の発車時刻"
                     className={`${inputCls} tnum`}
@@ -556,6 +589,33 @@ export function RouteEditor({
                     placeholder={"8: 05 25 45"}
                   />
                 </Field>
+                <Field label="平日の発車時刻（帰り・任意）">
+                  <textarea
+                    aria-label="帰りの平日の発車時刻"
+                    className={`${inputCls} tnum`}
+                    rows={2}
+                    value={d.timesReturnWeekday}
+                    onChange={(e) =>
+                      update(d.key, { timesReturnWeekday: e.target.value })
+                    }
+                    placeholder={"17: 05 15 25 35\n18: 05 15"}
+                  />
+                </Field>
+                <Field label="土休日の発車時刻（帰り・空欄なら帰りの平日と同じ）">
+                  <textarea
+                    aria-label="帰りの土休日の発車時刻"
+                    className={`${inputCls} tnum`}
+                    rows={2}
+                    value={d.timesReturnHoliday}
+                    onChange={(e) =>
+                      update(d.key, { timesReturnHoliday: e.target.value })
+                    }
+                    placeholder={"9: 05 25 45"}
+                  />
+                </Field>
+                <p className="text-xs text-[var(--dim)]">
+                  帰りの時刻は降車駅からの発車時刻です。未入力の場合は行きの時刻で代用します。駅・路線・乗車時間は両方向で共通です。
+                </p>
                 <details className="rounded-md border border-[var(--border)] p-2">
                   <summary className="cursor-pointer text-xs font-bold text-[var(--dim)]">
                     等間隔ダイヤから時刻を生成
@@ -637,8 +697,10 @@ export function RouteEditor({
                           }))
                         }
                       >
-                        <option value="weekday">平日</option>
-                        <option value="holiday">土休日</option>
+                        <option value="weekday">平日（行き）</option>
+                        <option value="holiday">土休日（行き）</option>
+                        <option value="returnWeekday">平日（帰り）</option>
+                        <option value="returnHoliday">土休日（帰り）</option>
                       </select>
                     </Field>
                   </div>
@@ -650,28 +712,6 @@ export function RouteEditor({
                     時刻を生成して反映
                   </button>
                 </details>
-                <div className="grid grid-cols-2 gap-2">
-                  <Field label="乗車駅の緯度（任意）">
-                    <input
-                      aria-label="乗車駅の緯度"
-                      className={inputCls}
-                      inputMode="decimal"
-                      value={d.lat}
-                      onChange={(e) => update(d.key, { lat: e.target.value })}
-                      placeholder="35.6896"
-                    />
-                  </Field>
-                  <Field label="乗車駅の経度（任意）">
-                    <input
-                      aria-label="乗車駅の経度"
-                      className={inputCls}
-                      inputMode="decimal"
-                      value={d.lng}
-                      onChange={(e) => update(d.key, { lng: e.target.value })}
-                      placeholder="139.7006"
-                    />
-                  </Field>
-                </div>
               </div>
             )}
           </div>
