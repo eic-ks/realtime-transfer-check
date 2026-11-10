@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
 import {
+applyTimetables,
 computePlans,
 detectDirection,
 effectiveDelayMin,
@@ -12,6 +13,7 @@ haversineM,
 nowJst,
 reversedRoute,
 routePoints,
+timetableKey,
 walkMinutes,
 type DayType,
 type Direction,
@@ -107,6 +109,11 @@ export function App() {
   const manualDelayMut = useMutation({
     mutationFn: (args: { line: string; delayMin: number | null }) =>
       api.setManualDelay(args),
+    onSuccess: invalidate,
+  });
+  const fetchTimetableMut = useMutation({
+    mutationFn: (args: { line: string; station: string; toward: string }) =>
+      api.fetchTimetable(args),
     onSuccess: invalidate,
   });
 
@@ -230,6 +237,9 @@ export function App() {
             onManualDelay={(line, delayMin) =>
               manualDelayMut.mutate({ line, delayMin })
             }
+            onFetchTimetable={(line, station, toward) =>
+              fetchTimetableMut.mutateAsync({ line, station, toward })
+            }
             onGoRoutes={() => setView("routes")}
           />
         )}
@@ -274,6 +284,7 @@ function BoardView({
   refreshNote,
   onRefreshLine,
   onManualDelay,
+  onFetchTimetable,
   onGoRoutes,
 }: {
   data: State;
@@ -287,6 +298,11 @@ function BoardView({
   refreshNote: { line: string; ok: boolean; message: string } | null;
   onRefreshLine: (line: string) => void;
   onManualDelay: (line: string, delayMin: number | null) => void;
+  onFetchTimetable: (
+    line: string,
+    station: string,
+    toward: string,
+  ) => Promise<{ ok: boolean; message: string | null }>;
   onGoRoutes: () => void;
 }) {
   const now = nowJst();
@@ -413,18 +429,76 @@ function BoardView({
     };
   }, [gps, displayRoute, positionIdx]);
 
+  // Timetables are fetched automatically from the route (line +
+  // stations), never typed by the user. Cached fetches are merged into
+  // the route here; segments still missing one are fetched on open.
+  const ttRoute: Route | null = useMemo(
+    () => (displayRoute ? applyTimetables(displayRoute, data.timetables) : null),
+    [displayRoute, data.timetables],
+  );
+  const ttAttemptedRef = useRef<Set<string>>(new Set());
+  const [ttStatus, setTtStatus] = useState<
+    Record<string, { state: "fetching" | "failed"; message?: string }>
+  >({});
+  const missingTimetables = useMemo(() => {
+    if (!ttRoute) return [];
+    const out: { key: string; line: string; station: string; toward: string }[] = [];
+    for (const seg of ttRoute.segments) {
+      if (seg.type !== "ride" || !seg.line) continue;
+      if (seg.departuresWeekday.length > 0) continue;
+      const station = seg.station ?? seg.fromLabel;
+      const key = timetableKey(seg.line, station, seg.toLabel);
+      if (!out.some((o) => o.key === key)) {
+        out.push({ key, line: seg.line, station, toward: seg.toLabel });
+      }
+    }
+    return out;
+  }, [ttRoute]);
+  useEffect(() => {
+    for (const m of missingTimetables) {
+      if (ttAttemptedRef.current.has(m.key)) continue;
+      ttAttemptedRef.current.add(m.key);
+      setTtStatus((p) => ({ ...p, [m.key]: { state: "fetching" } }));
+      void onFetchTimetable(m.line, m.station, m.toward)
+        .then((res) => {
+          if (!res.ok) {
+            setTtStatus((p) => ({
+              ...p,
+              [m.key]: {
+                state: "failed",
+                message: res.message ?? "取得できませんでした",
+              },
+            }));
+          } else {
+            setTtStatus((p) => {
+              const next = { ...p };
+              delete next[m.key];
+              return next;
+            });
+          }
+        })
+        .catch(() => {
+          setTtStatus((p) => ({
+            ...p,
+            [m.key]: { state: "failed", message: "取得に失敗しました" },
+          }));
+        });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [missingTimetables]);
+
   const planRoute: Route | null = useMemo(() => {
-    if (!displayRoute) return null;
-    if (!gpsInfo) return displayRoute;
+    if (!ttRoute) return null;
+    if (!gpsInfo) return ttRoute;
     return {
-      ...displayRoute,
-      segments: displayRoute.segments.map((s) =>
+      ...ttRoute,
+      segments: ttRoute.segments.map((s) =>
         s.id === gpsInfo.walkSegmentId
           ? { ...s, learnedWalkMin: gpsInfo.correctedMin }
           : s,
       ),
     };
-  }, [displayRoute, gpsInfo]);
+  }, [ttRoute, gpsInfo]);
 
   const plan = useMemo(() => {
     if (!planRoute) return null;
@@ -469,7 +543,7 @@ function BoardView({
         <TrainIcon size={40} className="mx-auto text-[var(--dim)]" />
         <p className="mt-4 text-base font-black">まだ経路が登録されていません</p>
         <p className="mx-auto mt-2 max-w-sm text-sm text-[var(--dim)]">
-          いつもの経路（出発地点→徒歩→電車→目的地）と、乗る電車の発車時刻を登録すると、今から歩いて乗れる電車をリアルタイムで案内します。
+          いつもの経路（出発地点→徒歩→電車→目的地）を登録すると、発車時刻は経路から自動で取得し、今いる場所と時刻から乗れる電車をリアルタイムで案内します。
         </p>
         <button
           type="button"
@@ -690,7 +764,7 @@ function BoardView({
       >
         {!plan.hasRide && (
           <p className="text-sm text-[var(--dim)]">
-            この経路には電車区間がありません。経路の編集から電車区間と発車時刻を追加してください。
+            この経路には電車区間がありません。経路の編集から電車区間を追加してください（発車時刻は自動で取得します）。
           </p>
         )}
         {plan.hasRide && plan.firstRideSuspended && (
@@ -875,6 +949,113 @@ function BoardView({
           </div>
         </section>
       )}
+
+      {/* 時刻表（自動取得） */}
+      <section aria-label="時刻表の自動取得" className="mt-5">
+        <h2 className="text-xs font-bold text-[var(--dim)]">時刻表（経路から自動取得）</h2>
+        <div className="mt-1.5 space-y-1.5">
+          {(ttRoute?.segments ?? [])
+            .filter((s) => s.type === "ride" && s.line)
+            .map((seg) => {
+              const station = seg.station ?? seg.fromLabel;
+              const key = timetableKey(seg.line as string, station, seg.toLabel);
+              const cached = data.timetables.find(
+                (t) => timetableKey(t.line, t.station, t.toward) === key,
+              );
+              const st = ttStatus[key];
+              const hasTimes = seg.departuresWeekday.length > 0;
+              return (
+                <div
+                  key={key}
+                  className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs"
+                >
+                  <span className="font-bold">
+                    {seg.line} {station}駅（{seg.toLabel}方面）
+                  </span>
+                  {hasTimes && cached ? (
+                    <>
+                      <span className="rounded bg-[#123c26] px-1.5 py-0.5 font-bold text-[#4ade80]">
+                        自動取得済み
+                      </span>
+                      <span className="text-[var(--dim)]">
+                        {minutesAgo(cached.fetchedAt)}
+                      </span>
+                      {cached.sourceUrl && (
+                        <a
+                          href={cached.sourceUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-[var(--dim)] underline"
+                        >
+                          出典: {cached.sourceTitle ?? "時刻表ページ"}
+                        </a>
+                      )}
+                      <button
+                        type="button"
+                        className="font-bold text-[var(--dim)] underline"
+                        onClick={() => {
+                          ttAttemptedRef.current.delete(key);
+                          setTtStatus((p) => ({
+                            ...p,
+                            [key]: { state: "fetching" },
+                          }));
+                          void onFetchTimetable(
+                            seg.line as string,
+                            station,
+                            seg.toLabel,
+                          ).then((res) => {
+                            if (!res.ok) {
+                              setTtStatus((p) => ({
+                                ...p,
+                                [key]: {
+                                  state: "failed",
+                                  message: res.message ?? "取得できませんでした",
+                                },
+                              }));
+                            }
+                          });
+                        }}
+                      >
+                        再取得
+                      </button>
+                    </>
+                  ) : hasTimes ? (
+                    <span className="text-[var(--dim)]">
+                      登録済みの時刻表を使用中
+                    </span>
+                  ) : st?.state === "fetching" ? (
+                    <span className="text-[var(--dim)]">時刻表を自動取得中…</span>
+                  ) : (
+                    <>
+                      <span className="font-bold text-[var(--warn)]">
+                        時刻表を自動取得できませんでした
+                        {st?.message ? `: ${st.message}` : ""}
+                      </span>
+                      <button
+                        type="button"
+                        className="font-bold underline"
+                        onClick={() => {
+                          ttAttemptedRef.current.delete(key);
+                          setTtStatus((p) => ({
+                            ...p,
+                            [key]: { state: "fetching" },
+                          }));
+                          void onFetchTimetable(
+                            seg.line as string,
+                            station,
+                            seg.toLabel,
+                          );
+                        }}
+                      >
+                        再試行
+                      </button>
+                    </>
+                  )}
+                </div>
+              );
+            })}
+        </div>
+      </section>
 
       {/* 運行情報 */}
       <section aria-label="運行情報" className="mt-5">

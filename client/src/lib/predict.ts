@@ -38,6 +38,58 @@ export interface RouteLike {
   segments: SegmentLike[];
 }
 
+export interface TimetableLike {
+  line: string;
+  station: string;
+  toward: string;
+  weekday: number[];
+  holiday: number[];
+}
+
+/** Station name without the generic 駅 suffix, as used in cache keys. */
+export function stationCore(name: string): string {
+  return name.replace(/\s+/g, "").replace(/駅$/, "");
+}
+
+export function timetableKey(
+  line: string,
+  station: string,
+  toward: string,
+): string {
+  return `${line}|${stationCore(station)}|${stationCore(toward)}`;
+}
+
+/**
+ * Fill ride segments that carry no user-registered timetable with the
+ * automatically fetched (cached) timetable for their line / boarding
+ * station / direction. Segments with their own departures keep them.
+ */
+export function applyTimetables(
+  route: RouteLike,
+  timetables: TimetableLike[],
+): RouteLike {
+  if (timetables.length === 0) return route;
+  const byKey = new Map(
+    timetables.map((t) => [timetableKey(t.line, t.station, t.toward), t]),
+  );
+  let changed = false;
+  const segments = route.segments.map((seg) => {
+    if (seg.type !== "ride" || !seg.line) return seg;
+    if (seg.departuresWeekday.length > 0) return seg;
+    const tt = byKey.get(
+      timetableKey(seg.line, seg.station ?? seg.fromLabel, seg.toLabel),
+    );
+    if (!tt || tt.weekday.length === 0) return seg;
+    changed = true;
+    return {
+      ...seg,
+      departuresWeekday: tt.weekday,
+      departuresHoliday: tt.holiday.length > 0 ? tt.holiday : tt.weekday,
+    };
+  });
+  return changed ? { ...route, segments } : route;
+}
+
 export interface StatusLike {
   line: string;
   status: "normal" | "delayed" | "suspended" | "unknown";

@@ -15,10 +15,10 @@
 import { useState, type ReactNode } from "react";
 import {
 formatTimes,
-generateTimes,
 parseTimes,
 type RouteLike,
 } from "../lib/predict";
+import { LineStationPicker } from "./LineStationPicker";
 import {
 ChevronDownIcon,
 ChevronUpIcon,
@@ -257,13 +257,14 @@ export function draftToPayload(
       if (!d.line.trim() || !d.place.name.trim() || !d.toPlace.name.trim()) {
         return { ok: false, error: `${label}: 路線名・乗車駅・降車駅を入力してください` };
       }
+      // Departure times are NOT entered at registration: they are
+      // fetched automatically from the route (line + stations) when
+      // the departure board needs them. Any timetable already stored
+      // on an older route is preserved as-is.
       const weekday = parseTimes(d.timesWeekday);
       const holiday = d.timesHoliday.trim()
         ? parseTimes(d.timesHoliday)
         : weekday;
-      if (weekday.length === 0) {
-        return { ok: false, error: `${label}: 平日の発車時刻を1本以上入力してください` };
-      }
       const rideMin = numOrNull(d.rideMin);
       if (rideMin == null || rideMin <= 0) {
         return { ok: false, error: `${label}: 乗車時間（分）を入力してください` };
@@ -395,9 +396,6 @@ export function RouteEditor({
   const [bufferMin, setBufferMin] = useState(String(initialBuffer));
   const [drafts, setDrafts] = useState<DraftSegment[]>(initialSegments);
   const [error, setError] = useState<string | null>(null);
-  const [gen, setGen] = useState<
-    Record<number, { first: string; last: string; interval: string; target: string }>
-  >({});
 
   const update = (key: number, patch: Partial<DraftSegment>) => {
     setDrafts((prev) =>
@@ -507,31 +505,6 @@ export function RouteEditor({
 
   const placeNear = (p: PlaceValue): { lat: number; lng: number } | null =>
     p.lat != null && p.lng != null ? { lat: p.lat, lng: p.lng } : null;
-
-  const applyGenerator = (key: number) => {
-    const g = gen[key];
-    if (!g) return;
-    const parse = (t: string) => {
-      const m = t.match(/^(\d{1,2}):(\d{2})$/);
-      return m && m[1] && m[2] ? Number(m[1]) * 60 + Number(m[2]) : null;
-    };
-    const first = parse(g.first);
-    const last = parse(g.last);
-    const interval = Number(g.interval);
-    if (first == null || last == null || !Number.isFinite(interval)) return;
-    const times = generateTimes(first, last, interval);
-    if (times.length === 0) return;
-    const text = formatTimes(times);
-    const patch: Partial<DraftSegment> =
-      g.target === "holiday"
-        ? { timesHoliday: text }
-        : g.target === "returnWeekday"
-          ? { timesReturnWeekday: text }
-          : g.target === "returnHoliday"
-            ? { timesReturnHoliday: text }
-            : { timesWeekday: text };
-    update(key, patch);
-  };
 
   const handleSave = () => {
     const result = draftToPayload(name, bufferMin, drafts);
@@ -667,22 +640,22 @@ export function RouteEditor({
 
             {d.type === "ride" && (
               <div className="mt-2 space-y-3">
-                <Field label="路線名">
-                  <input
-                    aria-label="路線名"
-                    className={inputCls}
-                    value={d.line}
-                    onChange={(e) => update(d.key, { line: e.target.value })}
-                    placeholder="例: JR山手線"
-                  />
-                </Field>
                 <ChainedStart label="乗車駅" value={d.place} />
-                <PlacePicker
-                  label="降車駅"
-                  namePlaceholder="例: 池袋"
+                <LineStationPicker
+                  line={d.line}
+                  onLineChange={(line) => update(d.key, { line })}
+                  boarding={d.place}
                   value={d.toPlace}
                   onChange={(toPlace) => setEndPlace(idx, toPlace)}
-                  near={placeNear(d.place)}
+                  fallback={
+                    <PlacePicker
+                      label="降車駅・バス停"
+                      namePlaceholder="例: 池袋"
+                      value={d.toPlace}
+                      onChange={(toPlace) => setEndPlace(idx, toPlace)}
+                      near={placeNear(d.place)}
+                    />
+                  }
                 />
                 <div className="grid grid-cols-2 gap-2">
                   <Field label="乗車時間（分）">
@@ -712,153 +685,9 @@ export function RouteEditor({
                     />
                   </Field>
                 </div>
-                <Field label="平日の発車時刻（行き）">
-                  <textarea
-                    aria-label="平日の発車時刻"
-                    className={`${inputCls} tnum`}
-                    rows={3}
-                    value={d.timesWeekday}
-                    onChange={(e) =>
-                      update(d.key, { timesWeekday: e.target.value })
-                    }
-                    placeholder={"7: 02 12 22 32\n8: 02 12"}
-                  />
-                </Field>
-                <Field label="土休日の発車時刻（行き・空欄なら平日と同じ）">
-                  <textarea
-                    aria-label="土休日の発車時刻"
-                    className={`${inputCls} tnum`}
-                    rows={2}
-                    value={d.timesHoliday}
-                    onChange={(e) =>
-                      update(d.key, { timesHoliday: e.target.value })
-                    }
-                    placeholder={"8: 05 25 45"}
-                  />
-                </Field>
-                <Field label="平日の発車時刻（帰り・任意）">
-                  <textarea
-                    aria-label="帰りの平日の発車時刻"
-                    className={`${inputCls} tnum`}
-                    rows={2}
-                    value={d.timesReturnWeekday}
-                    onChange={(e) =>
-                      update(d.key, { timesReturnWeekday: e.target.value })
-                    }
-                    placeholder={"17: 05 15 25 35\n18: 05 15"}
-                  />
-                </Field>
-                <Field label="土休日の発車時刻（帰り・空欄なら帰りの平日と同じ）">
-                  <textarea
-                    aria-label="帰りの土休日の発車時刻"
-                    className={`${inputCls} tnum`}
-                    rows={2}
-                    value={d.timesReturnHoliday}
-                    onChange={(e) =>
-                      update(d.key, { timesReturnHoliday: e.target.value })
-                    }
-                    placeholder={"9: 05 25 45"}
-                  />
-                </Field>
                 <p className="text-xs text-[var(--dim)]">
-                  帰りの時刻は降車駅からの発車時刻です。未入力の場合は行きの時刻で代用します。駅・路線・乗車時間は両方向で共通です。
+                  発車時刻は登録不要です。発車案内を開いたときに、路線と乗車駅・降車駅から時刻表を自動で取得して使います。駅・路線・乗車時間は行き・帰り両方向で共通です。路線図から降車駅を選べるのは鉄道の路線です。バス路線は路線図データを用意できないため、降車バス停は検索で登録してください（時刻表の自動取得も、取得元によっては失敗する場合があります）。
                 </p>
-                <details className="rounded-md border border-[var(--border)] p-2">
-                  <summary className="cursor-pointer text-xs font-bold text-[var(--dim)]">
-                    等間隔ダイヤから時刻を生成
-                  </summary>
-                  <div className="mt-2 grid grid-cols-4 gap-2">
-                    <Field label="始発">
-                      <input
-                        aria-label="生成元の始発時刻"
-                        className={inputCls}
-                        type="time"
-                        value={gen[d.key]?.first ?? ""}
-                        onChange={(e) =>
-                          setGen((p) => ({
-                            ...p,
-                            [d.key]: {
-                              first: e.target.value,
-                              last: p[d.key]?.last ?? "",
-                              interval: p[d.key]?.interval ?? "10",
-                              target: p[d.key]?.target ?? "weekday",
-                            },
-                          }))
-                        }
-                      />
-                    </Field>
-                    <Field label="終発">
-                      <input
-                        aria-label="生成元の終発時刻"
-                        className={inputCls}
-                        type="time"
-                        value={gen[d.key]?.last ?? ""}
-                        onChange={(e) =>
-                          setGen((p) => ({
-                            ...p,
-                            [d.key]: {
-                              first: p[d.key]?.first ?? "",
-                              last: e.target.value,
-                              interval: p[d.key]?.interval ?? "10",
-                              target: p[d.key]?.target ?? "weekday",
-                            },
-                          }))
-                        }
-                      />
-                    </Field>
-                    <Field label="間隔（分）">
-                      <input
-                        aria-label="生成元の間隔分数"
-                        className={inputCls}
-                        type="number"
-                        min={1}
-                        max={120}
-                        value={gen[d.key]?.interval ?? "10"}
-                        onChange={(e) =>
-                          setGen((p) => ({
-                            ...p,
-                            [d.key]: {
-                              first: p[d.key]?.first ?? "",
-                              last: p[d.key]?.last ?? "",
-                              interval: e.target.value,
-                              target: p[d.key]?.target ?? "weekday",
-                            },
-                          }))
-                        }
-                      />
-                    </Field>
-                    <Field label="対象">
-                      <select
-                        aria-label="生成先の日種"
-                        className={inputCls}
-                        value={gen[d.key]?.target ?? "weekday"}
-                        onChange={(e) =>
-                          setGen((p) => ({
-                            ...p,
-                            [d.key]: {
-                              first: p[d.key]?.first ?? "",
-                              last: p[d.key]?.last ?? "",
-                              interval: p[d.key]?.interval ?? "10",
-                              target: e.target.value,
-                            },
-                          }))
-                        }
-                      >
-                        <option value="weekday">平日（行き）</option>
-                        <option value="holiday">土休日（行き）</option>
-                        <option value="returnWeekday">平日（帰り）</option>
-                        <option value="returnHoliday">土休日（帰り）</option>
-                      </select>
-                    </Field>
-                  </div>
-                  <button
-                    type="button"
-                    className="mt-2 rounded-md bg-[var(--accent-dim)] px-3 py-1.5 text-xs font-bold text-white"
-                    onClick={() => applyGenerator(d.key)}
-                  >
-                    時刻を生成して反映
-                  </button>
-                </details>
               </div>
             )}
           </div>

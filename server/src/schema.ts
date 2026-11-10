@@ -78,6 +78,23 @@ export const lineStatus = sqliteTable("line_status", {
   fetchedAt: integer("fetched_at", { mode: "timestamp_ms" }),
 });
 
+// Timetables are no longer typed in by the user at route registration.
+// They are fetched automatically (per line + boarding station + the
+// direction's alighting station) from timetable pages when the board
+// needs them, and cached here with their source.
+export const timetableCache = sqliteTable("timetable_cache", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  line: text("line").notNull(),
+  station: text("station").notNull(),
+  toward: text("toward").notNull(),
+  // JSON number[]: departure minutes-of-day.
+  weekday: text("weekday"),
+  holiday: text("holiday"),
+  sourceUrl: text("source_url"),
+  sourceTitle: text("source_title"),
+  fetchedAt: integer("fetched_at", { mode: "timestamp_ms" }),
+});
+
 export const appSettings = sqliteTable("app_settings", {
   id: integer("id").primaryKey(),
   activeRouteId: integer("active_route_id"),
