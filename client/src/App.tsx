@@ -5,6 +5,7 @@ import { api, type ApiResponse } from "./api";
 import {
 applyTimetables,
 computePlans,
+computeScenarios,
 detectDirection,
 effectiveDelayMin,
 fmtCountdown,
@@ -43,6 +44,16 @@ type Segment = Route["segments"][number];
 type LineStatusRow = State["lineStatuses"][number];
 
 type View = "board" | "routes" | "learn";
+
+/** Ekitan cache rows fetched before this instant predate the
+ * 2026-11-10 parser fix (operator line names + per-direction block
+ * isolation) and are refetched once when the board opens. */
+const TIMETABLE_FIX_EPOCH_MS = Date.parse("2026-11-10T11:00:00.000Z");
+
+/** Station names picked from place search often already end in 駅
+ * (なんば駅); append the suffix only when it is missing. */
+const stationLabel = (name: string): string =>
+  name.endsWith("駅") ? name : `${name}駅`;
 
 const STATUS_META: Record<
   LineStatusRow["status"],
@@ -310,6 +321,7 @@ function BoardView({
   const dayType = dayOverride ?? now.dayType;
   const [positionIdx, setPositionIdx] = useState(0);
   const [selectedOption, setSelectedOption] = useState(0);
+  const [selectedScenarioId, setSelectedScenarioId] = useState<string | null>(null);
   const [gps, setGps] = useState<{ lat: number; lng: number } | null>(null);
   const [gpsNote, setGpsNote] = useState<string | null>(null);
   // Direction: manual correction wins; then the server-stored detection;
@@ -339,6 +351,7 @@ function BoardView({
   useEffect(() => {
     setPositionIdx(0);
     setSelectedOption(0);
+    setSelectedScenarioId(null);
     setGps(null);
     setGpsNote(null);
     setManualDir(null);
@@ -351,6 +364,7 @@ function BoardView({
   useEffect(() => {
     setPositionIdx(0);
     setSelectedOption(0);
+    setSelectedScenarioId(null);
   }, [dir]);
 
   // Keep watching the position while the board is open: direction
@@ -445,15 +459,37 @@ function BoardView({
     const out: { key: string; line: string; station: string; toward: string }[] = [];
     for (const seg of ttRoute.segments) {
       if (seg.type !== "ride" || !seg.line) continue;
-      if (seg.departuresWeekday.length > 0) continue;
       const station = seg.station ?? seg.fromLabel;
       const key = timetableKey(seg.line, station, seg.toLabel);
+      let needs = seg.departuresWeekday.length === 0;
+      if (!needs) {
+        // Timetable rows cached before the 2026-11-10 ekitan parser
+        // fix can hold the opposite direction's departures merged in
+        // (mid-line stations) — treat those ekitan rows as missing so
+        // they are refetched once with the fixed parser. Segments
+        // with their own stored departures and GTFS rows are exempt.
+        const raw = displayRoute?.segments.find((s) => s.id === seg.id);
+        const ownTimes = (raw?.departuresWeekday.length ?? 0) > 0;
+        if (!ownTimes) {
+          const row = data.timetables.find(
+            (t) => timetableKey(t.line, t.station, t.toward) === key,
+          );
+          if (
+            row?.sourceUrl?.includes("ekitan.com") &&
+            row.fetchedAt != null &&
+            Date.parse(row.fetchedAt) < TIMETABLE_FIX_EPOCH_MS
+          ) {
+            needs = true;
+          }
+        }
+      }
+      if (!needs) continue;
       if (!out.some((o) => o.key === key)) {
         out.push({ key, line: seg.line, station, toward: seg.toLabel });
       }
     }
     return out;
-  }, [ttRoute]);
+  }, [ttRoute, displayRoute, data.timetables]);
   useEffect(() => {
     for (const m of missingTimetables) {
       if (ttAttemptedRef.current.has(m.key)) continue;
@@ -503,6 +539,20 @@ function BoardView({
   const plan = useMemo(() => {
     if (!planRoute) return null;
     return computePlans(
+      planRoute,
+      dayType,
+      statuses,
+      now.minutesFloat,
+      positionIdx,
+    );
+  }, [planRoute, dayType, statuses, now.minutesFloat, positionIdx]);
+
+  // Scenario comparison: the fastest full traversal vs variants that
+  // pass up one departure at a single boarding point, each simulated
+  // through every downstream transfer to the final arrival.
+  const scenarios = useMemo(() => {
+    if (!planRoute) return [];
+    return computeScenarios(
       planRoute,
       dayType,
       statuses,
@@ -573,13 +623,22 @@ function BoardView({
           i === 0
             ? s.toLabel || "出発地点"
             : s.type === "ride"
-              ? `${s.station ?? s.fromLabel}駅`
+              ? stationLabel(s.station ?? s.fromLabel)
               : s.fromLabel,
       });
     }
   });
   const main: PlanOption | undefined =
     plan.options[selectedOption] ?? plan.options[0];
+  const selectedScenario =
+    scenarios.find((s) => s.id === selectedScenarioId) ?? null;
+  const shownPlan: PlanOption | undefined = selectedScenario?.plan ?? main;
+  const baselinePlan = scenarios[0]?.plan ?? null;
+  const baselineLegs = new Map(
+    (baselinePlan?.legs ?? [])
+      .filter((l) => l.kind === "ride")
+      .map((l) => [l.segmentId, l] as const),
+  );
   const firstRideSeg = shownRoute.segments.find(
     (s) => s.id === plan.firstRideSegmentId,
   );
@@ -731,7 +790,7 @@ function BoardView({
         {gpsNote && <p className="mt-1.5 text-xs text-[var(--warn)]">{gpsNote}</p>}
         {gps && gpsInfo && (
           <p className="mt-1.5 flex items-center gap-2 text-xs font-bold text-[#4ade80]">
-            現在地補正中: {gpsInfo.station}駅まで直線約
+            現在地補正中: {stationLabel(gpsInfo.station)}まで直線約
             {Math.round(gpsInfo.remainingM)}m・残り徒歩 約{gpsInfo.correctedMin}
             分（目安）
             <button
@@ -781,15 +840,29 @@ function BoardView({
             </div>
           </div>
         )}
-        {plan.hasRide && !plan.firstRideSuspended && !main && (
+        {plan.hasRide && !plan.firstRideSuspended && !shownPlan && (
           <p className="text-sm text-[var(--dim)]">
             乗れる電車を計算できませんでした。発車時刻と徒歩分数を確認してください。
           </p>
         )}
-        {main && firstRideSeg && (
+        {shownPlan && firstRideSeg && (
           <div>
+            {selectedScenario && selectedScenario.id !== "fastest" && (
+              <p className="mb-2 flex flex-wrap items-center gap-2">
+                <span className="rounded bg-[#3d2c07] px-1.5 py-0.5 text-xs font-bold text-[#fbbf24]">
+                  シナリオ: {selectedScenario.label}
+                </span>
+                <button
+                  type="button"
+                  className="text-xs font-bold text-[var(--dim)] underline"
+                  onClick={() => setSelectedScenarioId(null)}
+                >
+                  最短に戻す
+                </button>
+              </p>
+            )}
             <p className="text-xs font-bold text-[var(--dim)]">
-              {main.nextDay
+              {shownPlan.nextDay
                 ? "本日の運行は終了しています — 明日の始発"
                 : plan.endOfService
                   ? "明日の始発"
@@ -798,7 +871,7 @@ function BoardView({
             <p className="mt-1 flex flex-wrap items-baseline gap-x-2">
               <span className="text-lg font-black">{firstRideSeg.line}</span>
               <span className="text-sm text-[var(--dim)]">
-                {firstRideSeg.station}駅
+                {stationLabel(firstRideSeg.station ?? "")}
               </span>
               {firstRideDelay > 0 && (
                 <span className="rounded bg-[#3d2c07] px-1.5 py-0.5 text-xs font-bold text-[#fbbf24]">
@@ -808,28 +881,28 @@ function BoardView({
             </p>
             <div className="mt-2 flex flex-wrap items-end gap-x-4 gap-y-1">
               <p className="tnum text-5xl font-bold leading-none">
-                {fmtTime(main.boardAt)}
+                {fmtTime(shownPlan.boardAt)}
                 <span className="ml-1 text-xl font-bold">発</span>
               </p>
               <p className="pb-0.5 text-sm text-[var(--dim)]">
                 {firstRideDelay > 0 && (
-                  <>定刻 {fmtTime(main.boardAtSched)} ・ </>
+                  <>定刻 {fmtTime(shownPlan.boardAtSched)} ・ </>
                 )}
                 目的地到着{" "}
                 <span className="tnum text-base font-bold text-[var(--text)]">
-                  {fmtTime(main.arriveAt)}
+                  {fmtTime(shownPlan.arriveAt)}
                 </span>
               </p>
             </div>
             <div className="mt-3 rounded-lg bg-[var(--bg)] px-3 py-2.5">
-              {main.leaveBy > now.minutesFloat ? (
+              {shownPlan.leaveBy > now.minutesFloat ? (
                 <p className="flex items-baseline gap-2">
                   <span className="text-sm font-bold">出発まで あと</span>
                   <span className="tnum text-3xl font-bold text-[var(--accent)]">
-                    {fmtCountdown((main.leaveBy - now.minutesFloat) * 60)}
+                    {fmtCountdown((shownPlan.leaveBy - now.minutesFloat) * 60)}
                   </span>
                   <span className="text-xs text-[var(--dim)]">
-                    （{fmtTime(main.leaveBy)} 出発）
+                    （{fmtTime(shownPlan.leaveBy)} 出発）
                   </span>
                 </p>
               ) : (
@@ -838,9 +911,9 @@ function BoardView({
                 </p>
               )}
               <p className="mt-1 text-xs text-[var(--dim)]">
-                駅のホームまで約{Math.round(main.toPlatformMin)}分
+                駅のホームまで約{Math.round(shownPlan.toPlatformMin)}分
                 {(() => {
-                  const firstWalk = main.legs.find((l) => l.kind === "walk");
+                  const firstWalk = shownPlan.legs.find((l) => l.kind === "walk");
                   return firstWalk?.learned ? "（あなたの歩行ペースで学習済み）" : "";
                 })()}
                 ＋余裕{activeRoute.bufferMin}分で計算しています
@@ -849,8 +922,8 @@ function BoardView({
 
             {/* 行程の内訳 */}
             <ol className="mt-3 space-y-2">
-              {main.legs.map((leg, i) => {
-                const prevRide = main.legs
+              {shownPlan.legs.map((leg, i) => {
+                const prevRide = shownPlan.legs
                   .slice(0, i)
                   .filter((l) => l.kind === "ride")
                   .pop();
@@ -936,7 +1009,10 @@ function BoardView({
                 <button
                   key={opt.boardAtSched}
                   type="button"
-                  onClick={() => setSelectedOption(i)}
+                  onClick={() => {
+                    setSelectedScenarioId(null);
+                    setSelectedOption(i);
+                  }}
                   className="tnum flex w-full items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-left text-sm"
                 >
                   <span className="font-bold">{fmtTime(opt.boardAt)}発</span>
@@ -946,6 +1022,130 @@ function BoardView({
                 </button>
               ),
             )}
+          </div>
+        </section>
+      )}
+
+      {/* シナリオ比較 */}
+      {scenarios.length > 1 && baselinePlan && (
+        <section aria-label="シナリオ比較" className="mt-5">
+          <h2 className="text-xs font-bold text-[var(--dim)]">
+            シナリオ比較（今からこの経路を辿ったら）
+          </h2>
+          <p className="mt-1 text-xs leading-relaxed text-[var(--dim)]">
+            各駅で最初に乗れる電車に乗り継ぐ「最短」と、どこか1か所で1本見送る場合を、最後の到着まで計算し直した比較です。途中で早く着いても最後の乗り換えで長く待つかどうかが、ここで見分けられます。
+          </p>
+          <div className="mt-2 space-y-2">
+            {scenarios.map((s) => {
+              const isBaseline = s.id === "fastest";
+              const arriveDiff = Math.round(s.plan.arriveAt - baselinePlan.arriveAt);
+              const selected = selectedScenarioId === s.id;
+              return (
+                <div
+                  key={s.id}
+                  className={`rounded-xl border bg-[var(--surface)] p-3 ${
+                    selected
+                      ? "border-[var(--accent)]"
+                      : "border-[var(--border)]"
+                  }`}
+                >
+                  <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5">
+                    <p className="text-sm font-black">{s.label}</p>
+                    <p className="tnum text-sm">
+                      <span className="mr-1 text-xs text-[var(--dim)]">
+                        最終到着
+                      </span>
+                      <span className="text-lg font-bold">
+                        {fmtTime(s.plan.arriveAt)}
+                      </span>
+                    </p>
+                  </div>
+                  <p className="mt-0.5 text-xs text-[var(--dim)]">
+                    {s.description}
+                  </p>
+                  <div className="mt-1.5 flex flex-wrap gap-1.5 text-[11px] font-bold">
+                    {isBaseline ? (
+                      <span className="rounded bg-[#123c26] px-1.5 py-0.5 text-[#4ade80]">
+                        最短
+                      </span>
+                    ) : arriveDiff > 0 ? (
+                      <span className="rounded bg-[#3d2c07] px-1.5 py-0.5 text-[#fbbf24]">
+                        到着 +{arriveDiff}分
+                      </span>
+                    ) : (
+                      <span className="rounded bg-[#123c26] px-1.5 py-0.5 text-[#4ade80]">
+                        到着は最短と同じ
+                      </span>
+                    )}
+                    <span className="rounded bg-[var(--surface2)] px-1.5 py-0.5 text-[var(--dim)]">
+                      乗り換え待ち合計 {s.plan.totalWaitMin}分
+                    </span>
+                  </div>
+                  <ol className="mt-2 space-y-1.5">
+                    {s.plan.legs
+                      .filter((l) => l.kind === "ride")
+                      .map((leg) => {
+                        const baseLeg = baselineLegs.get(leg.segmentId);
+                        const diff =
+                          !isBaseline &&
+                          baseLeg?.depart != null &&
+                          leg.depart != null
+                            ? Math.round(leg.depart - baseLeg.depart)
+                            : 0;
+                        return (
+                          <li key={leg.segmentId} className="text-sm">
+                            {leg.waitMin != null && (
+                              <span
+                                className={`mb-0.5 inline-block rounded px-1.5 py-0.5 text-[11px] font-bold ${
+                                  leg.waitMin >= 10
+                                    ? "bg-[#3d2c07] text-[#fbbf24]"
+                                    : "bg-[var(--surface2)] text-[var(--dim)]"
+                                }`}
+                              >
+                                {leg.fromStation}で待ち {leg.waitMin}分
+                              </span>
+                            )}
+                            <p>
+                              <span className="font-bold">{leg.line}</span>{" "}
+                              {leg.fromStation}
+                              <span
+                                className={`tnum ml-1.5 font-bold ${
+                                  diff !== 0 ? "text-[#fbbf24]" : ""
+                                }`}
+                              >
+                                {leg.depart != null ? fmtTime(leg.depart) : ""}発
+                              </span>
+                              {diff !== 0 && (
+                                <span className="ml-1 text-[11px] font-bold text-[#fbbf24]">
+                                  （最短より{diff > 0 ? "+" : ""}
+                                  {diff}分）
+                                </span>
+                              )}
+                              <span className="text-[var(--dim)]"> → </span>
+                              {leg.toStation}
+                              <span className="tnum ml-1.5">
+                                {leg.arrive != null ? fmtTime(leg.arrive) : ""}着
+                              </span>
+                            </p>
+                          </li>
+                        );
+                      })}
+                  </ol>
+                  <button
+                    type="button"
+                    disabled={selected}
+                    onClick={() => setSelectedScenarioId(s.id)}
+                    className={`mt-2 rounded-lg border px-3 py-1.5 text-xs font-bold ${
+                      selected
+                        ? "border-[var(--accent)] text-[#4ade80]"
+                        : "border-[var(--border)] text-[var(--dim)]"
+                    }`}
+                  >
+                    {selected ? "このシナリオを表示中" : "このシナリオで表示"}
+                  </button>
+                </div>
+              );
+            })}
           </div>
         </section>
       )}
@@ -970,9 +1170,11 @@ function BoardView({
                   className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs"
                 >
                   <span className="font-bold">
-                    {seg.line} {station}駅（{seg.toLabel}方面）
+                    {seg.line} {stationLabel(station)}（{seg.toLabel}方面）
                   </span>
-                  {hasTimes && cached ? (
+                  {st?.state === "fetching" ? (
+                    <span className="text-[var(--dim)]">時刻表を自動取得中…</span>
+                  ) : hasTimes && cached ? (
                     <>
                       <span className="rounded bg-[#123c26] px-1.5 py-0.5 font-bold text-[#4ade80]">
                         自動取得済み
@@ -1023,8 +1225,6 @@ function BoardView({
                     <span className="text-[var(--dim)]">
                       登録済みの時刻表を使用中
                     </span>
-                  ) : st?.state === "fetching" ? (
-                    <span className="text-[var(--dim)]">時刻表を自動取得中…</span>
                   ) : (
                     <>
                       <span className="font-bold text-[var(--warn)]">

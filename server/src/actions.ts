@@ -879,7 +879,35 @@ function lineNameMatch(want: string, got: string): boolean {
   const w = norm(want);
   const g = norm(got);
   if (!w || !g) return false;
-  return w === g || g.includes(w) || w.includes(g);
+  if (w === g || g.includes(w) || w.includes(g)) return true;
+  // Operator branding: ekitan names subway lines WITH the operator
+  // (大阪メトロ御堂筋線) while the station DB (HeartRails) drops it
+  // (大阪御堂筋線), so the plain substring checks fail on the infix
+  // メトロ. Compare once more with operator/city words removed from
+  // both sides (exact equality on the stripped core, min length 2,
+  // so distinct lines like 谷町線 vs 中央線 never collide).
+  const bare = (s: string) =>
+    norm(s)
+      .replace(/^(?:大阪メトロ|東京メトロ|都営|市営|営団)/u, "")
+      .replace(/(?:メトロ|地下鉄|市営|都営)/gu, "")
+      .replace(/^(?:大阪|東京|名古屋|京都|神戸|福岡|札幌|仙台|横浜)/u, "");
+  const bw = bare(want);
+  const bg = bare(got);
+  return bw.length >= 2 && bw === bg;
+}
+
+/**
+ * True when two station name cores plausibly name the same station:
+ * exact, or one is the other with a city/operator prefix difference
+ * (梅田 vs 大阪梅田, 難波 vs 大阪難波). Used when matching a stored
+ * station name against a line diagram or an ekitan station list,
+ * where the same physical station is named per-operator.
+ */
+function stationCoreLooseEq(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+  return short.length >= 2 && (long as string).endsWith(short as string);
 }
 
 /**
@@ -905,18 +933,26 @@ async function pickEkitanDirection(
     label
       .replace(/方面$/u, "")
       .split(/[・、/／]/u)
-      .map((t) => coreName(t.trim()))
+      .map((t) => coreName(t.replace(/\(.*?\)|（.*?）/gu, "").trim()))
       .filter(Boolean);
 
   // A renamed station (阪急梅田) is on the line diagram only under
   // its current name (大阪梅田), so both ends match by any variant.
+  // The match is also prefix-tolerant (stationCoreLooseEq): the same
+  // physical station is 梅田 on the Metro diagram but 大阪梅田 on
+  // Hankyu's, and the stored alighting name follows whichever
+  // operator the user picked it from.
   const boardingCores = stationNameVariants(boardingCore);
   const alightingCores = stationNameVariants(alightingCore);
   try {
     const stations = await heartRailsLineStations(line);
     const cores = stations.map((s) => coreName(s.name));
-    const bi = cores.findIndex((c) => boardingCores.includes(c));
-    const ai = cores.findIndex((c) => alightingCores.includes(c));
+    const bi = cores.findIndex((c) =>
+      boardingCores.some((v) => stationCoreLooseEq(c, v)),
+    );
+    const ai = cores.findIndex((c) =>
+      alightingCores.some((v) => stationCoreLooseEq(c, v)),
+    );
     if (bi >= 0 && ai >= 0 && bi !== ai) {
       const side = new Set(
         ai > bi ? cores.slice(bi + 1) : cores.slice(0, bi).reverse(),
@@ -931,7 +967,9 @@ async function pickEkitanDirection(
 
   for (const d of dirs) {
     if (
-      labelTokens(d.label).some((t) => alightingCores.includes(t))
+      labelTokens(d.label).some((t) =>
+        alightingCores.some((v) => stationCoreLooseEq(t, v)),
+      )
     ) {
       return d;
     }
@@ -939,27 +977,112 @@ async function pickEkitanDirection(
 
   // Last resort: open each direction's first train and see which one
   // actually stops at the alighting station after the boarding one.
+  // Comparing first occurrences in the whole page text does NOT work:
+  // the train page header names the boarding station before the stop
+  // list starts, so a wrong-direction train whose route passes the
+  // alighting station BEFORE the boarding one still "matches".
+  // Compare positions inside the extracted stop sequence instead
+  // (entries are "HH:MM発 <station>" / terminus "HH:MM着 <station>").
+  const stopSequence = (text: string): string[] => {
+    const hits: { idx: number; name: string }[] = [];
+    const push = (re: RegExp) => {
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(text)) !== null) {
+        const name = coreName(
+          (m[1] ?? "").replace(/\(.*?\)|（.*?）/gu, ""),
+        );
+        if (name) hits.push({ idx: m.index, name });
+      }
+    };
+    push(/\d{1,2}:\d{2}発\s+([^\s－]+)/g);
+    push(/\d{1,2}:\d{2}着\s+([^\s－\d][^\s－]*)/g);
+    return hits.sort((a, b) => a.idx - b.idx).map((h) => h.name);
+  };
   for (const d of dirs) {
     const page = await fetchPageText(d.url);
     if (!page) continue;
+    // The direction page embeds BOTH directions' blocks; the first
+    // train link in raw HTML order belongs to direction 1's block
+    // regardless of which direction this page shows, so look inside
+    // this direction's own block only.
+    const dNumRaw = /\/d(\d)$/.exec(d.url)?.[1];
+    const block = ekitanDirectionSlice(
+      page,
+      dNumRaw != null ? Number(dNumRaw) : undefined,
+    );
     const trainHref =
-      /href="(\/timetable\/railway\/train\?[^"]+)"/.exec(page)?.[1];
+      /href="(\/timetable\/railway\/train\?[^"]+)"/.exec(block)?.[1];
     if (!trainHref) continue;
     const trainHtml = await fetchPageText(EKITAN_BASE + trainHref);
     if (!trainHtml) continue;
-    const text = htmlToText(trainHtml);
-    const bIdx = text.indexOf(boardingCore);
-    const aIdx = text.indexOf(alightingCore);
-    if (bIdx >= 0 && aIdx > bIdx) return d;
+    const seq = stopSequence(htmlToText(trainHtml));
+    const bPos = seq.findIndex((n) =>
+      boardingCores.some((v) => stationCoreLooseEq(n, v)),
+    );
+    const aPos = seq.findIndex((n) =>
+      alightingCores.some((v) => stationCoreLooseEq(n, v)),
+    );
+    if (bPos >= 0 && aPos > bPos) return d;
   }
   return only ?? null;
 }
 
-/** Departure minutes-of-day from an ekitan direction page. */
-function parseEkitanTimes(html: string): number[] {
-  const text = htmlToText(html);
+/**
+ * Slice one direction's timetable block out of an ekitan page (see
+ * parseEkitanTimes for why both blocks are always present). Picks
+ * the block whose data-direction matches dirNum, else the block
+ * without the `hidden` class (the one the page itself displays),
+ * else the first block. Returns the whole HTML when the page has no
+ * direction blocks (terminus stations, older layouts).
+ */
+function ekitanDirectionSlice(html: string, dirNum?: number): string {
+  const blockRe =
+    /<div class="search-result-body[^>]*?data-direction="(\d)"/g;
+  const starts: { idx: number; num: number; hidden: boolean }[] = [];
+  let bm: RegExpExecArray | null;
+  while ((bm = blockRe.exec(html)) !== null) {
+    const tagEnd = html.indexOf(">", bm.index);
+    const tag = tagEnd >= 0 ? html.slice(bm.index, tagEnd + 1) : "";
+    starts.push({
+      idx: bm.index,
+      num: Number(bm[1]),
+      hidden: /\bhidden\b/.test(tag),
+    });
+  }
+  if (starts.length === 0) return html;
+  const chosen =
+    (dirNum != null ? starts.find((s) => s.num === dirNum) : undefined) ??
+    starts.find((s) => !s.hidden) ??
+    starts[0];
+  if (!chosen) return html;
+  const next = starts.find((s) => s.idx > chosen.idx);
+  return html.slice(chosen.idx, next ? next.idx : undefined);
+}
+
+/**
+ * Departure minutes-of-day from an ekitan direction page.
+ *
+ * Each direction's timetable lives in its own
+ * `<div class="search-result-body ..." data-direction="N">` block and
+ * BOTH blocks are present in the page HTML (the unselected one just
+ * carries a `hidden` class) — on d1 and d2 pages alike, in the same
+ * order. Slicing the whole page text therefore merges the two
+ * directions' departures into one list (verified live: なんば
+ * 御堂筋線 d1 page parsed to 561 times instead of 316 northbound +
+ * 313 southbound; 三日市町 merged 167 instead of 100). Terminus
+ * stations have a single block, which is why earlier spot checks
+ * passed. Isolate the requested direction's block in the raw HTML
+ * before stripping tags: by data-direction number (from the /dN URL),
+ * else the block without `hidden`, else the first block.
+ */
+function parseEkitanTimes(html: string, dirNum?: number): number[] {
+  const slice = ekitanDirectionSlice(html, dirNum);
+  const text = htmlToText(slice);
   const anchor = text.indexOf("すべての時刻");
-  const seg = anchor >= 0 ? text.slice(anchor) : text;
+  let seg = anchor >= 0 ? text.slice(anchor) : text;
+  // Belt and braces: never read past a second timetable block.
+  const second = seg.indexOf("すべての時刻", 1);
+  if (second > 0) seg = seg.slice(0, second);
   const out = new Set<number>();
   const re = /(\d{1,2}):(\d{2})/g;
   let m: RegExpExecArray | null;
@@ -2342,7 +2465,15 @@ stationUrl: string,
 const html = await fetchPageText(stationUrl);
 if (!html) return null;
 const title = /<title>([^<]+)<\/title>/.exec(html)?.[1] ?? "";
-if (!stationCores.some((c) => title.includes(c))) return null;
+// The page title names the station per operator (梅田駅(大阪メトロ))
+// while the stored name may carry another operator's prefix
+// (大阪梅田駅), so the city-prefix-stripped short form also counts.
+const titleOk = stationCores.some((c) => {
+if (title.includes(c)) return true;
+const short = c.replace(/^(?:大阪|東京|京都|神戸|名古屋)/u, "");
+return short.length >= 2 && title.includes(short);
+});
+if (!titleOk) return null;
 const blocks = parseEkitanStationPage(html);
 const block = blocks.find((b) => lineNameMatch(args.line, b.line));
 return block ? block.directions : null;
@@ -2360,7 +2491,10 @@ let am: RegExpExecArray | null;
 while ((am = anchorRe.exec(html)) !== null) {
 const href = am[1];
 const name = (am[2] ?? "").replace(/\(.*?\)|（.*?）/gu, "");
-if (href && stationCores.includes(coreName(name))) {
+if (
+href &&
+stationCores.some((v) => stationCoreLooseEq(coreName(name), v))
+) {
 return fromStationPage(EKITAN_BASE + href);
 }
 }
@@ -2387,7 +2521,7 @@ let prefArea: number | null = null;
 try {
 const stations = await heartRailsLineStations(args.line);
 const boarding = stations.find((s) =>
-stationCores.includes(coreName(s.name)),
+stationCores.some((v) => stationCoreLooseEq(coreName(s.name), v)),
 );
 if (boarding) {
 prefArea = PREFECTURE_AREA[boarding.prefecture] ?? null;
@@ -2491,7 +2625,12 @@ const url = `${EKITAN_BASE}/timetable/railway/line-station/${code}/${d}`;
 const html = await fetchPageText(url);
 if (!html) continue;
 const title = /<title>([^<]+)<\/title>/.exec(html)?.[1] ?? "";
-if (!stationCores.some((c) => title.includes(c))) continue;
+const titleOk = stationCores.some((c) => {
+if (title.includes(c)) return true;
+const short = c.replace(/^(?:大阪|東京|京都|神戸|名古屋)/u, "");
+return short.length >= 2 && title.includes(short);
+});
+if (!titleOk) continue;
 const label = /(\S+方面)の時刻表/u.exec(title)?.[1];
 if (label) dirs.push({ url, label });
 }
@@ -2512,14 +2651,16 @@ stationCore,
 towardCore,
 );
 if (!dir) return { error: "方面（方向）を特定できませんでした" };
+const dirNumRaw = /\/d(\d)$/.exec(dir.url)?.[1];
+const dirNum = dirNumRaw != null ? Number(dirNumRaw) : undefined;
 const weekdayHtml = await fetchPageText(
 `${dir.url}?dt=${nextJstDate(2)}`,
 );
 const holidayHtml = await fetchPageText(
 `${dir.url}?dt=${nextJstDate(6)}`,
 );
-const weekday = weekdayHtml ? parseEkitanTimes(weekdayHtml) : [];
-let holiday = holidayHtml ? parseEkitanTimes(holidayHtml) : [];
+const weekday = weekdayHtml ? parseEkitanTimes(weekdayHtml, dirNum) : [];
+let holiday = holidayHtml ? parseEkitanTimes(holidayHtml, dirNum) : [];
 if (weekday.length < 5) {
 return { error: "駅探の時刻表から発車時刻を読み取れませんでした" };
 }

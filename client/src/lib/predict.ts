@@ -128,6 +128,9 @@ export interface LegPlan {
   arrive: number | null; // effective arrival at alighting station
   delayMin: number;
   suspended: boolean;
+  /** Transfer wait before this ride: depart − previous ride's arrival
+   * − this segment's access minutes. Null for walks and the first ride. */
+  waitMin: number | null;
 }
 
 export interface PlanOption {
@@ -143,6 +146,8 @@ export interface PlanOption {
   /** Minutes from the start point to the first platform (walks + access). */
   toPlatformMin: number;
   nextDay: boolean;
+  /** Sum of transfer waits between rides (access minutes excluded). */
+  totalWaitMin: number;
 }
 
 export interface PlanResult {
@@ -219,6 +224,7 @@ export function computePlans(
     arrive: null,
     delayMin: 0,
     suspended: false,
+    waitMin: null,
   });
 
   /** Build a full itinerary whose first ride departs at firstSchedAbs
@@ -235,6 +241,8 @@ export function computePlans(
     let boardAt = 0;
     let boardAtSched = 0;
     let rideCount = 0;
+    let prevRideArrive: number | null = null;
+    let totalWaitMin = 0;
     for (let i = firstRideIdx; i < segs.length; i++) {
       const seg = segs[i];
       if (!seg) continue;
@@ -252,19 +260,35 @@ export function computePlans(
         schedAbs = firstSchedAbs;
       } else {
         const earliest = cur + (seg.accessMin ?? 0);
+        // Earliest catchable departure TODAY; only when none remains
+        // does the chain continue on tomorrow's first departure.
+        // (Checking [today, tomorrow] per departure and taking the
+        // first hit is wrong: for an early-morning departure that has
+        // already left, its tomorrow instance always "matches", so
+        // the chain jumps to tomorrow even in the middle of the day —
+        // this once produced a 505-minute "wait" at なんば at 20:52.)
         for (const d of segDeps) {
-          for (const dayOff of [0, 1440]) {
-            if (d + dayOff + segDelay >= earliest) {
-              schedAbs = d + dayOff;
-              break;
-            }
+          if (d + segDelay >= earliest) {
+            schedAbs = d;
+            break;
           }
-          if (schedAbs != null) break;
+        }
+        if (schedAbs == null) {
+          const firstDep = segDeps[0];
+          if (firstDep != null) schedAbs = firstDep + 1440;
         }
       }
       if (schedAbs == null) return null;
       const departAbs = schedAbs + segDelay;
       const arrive = departAbs + (seg.rideMin ?? 0);
+      const waitMin =
+        rideCount > 0 && prevRideArrive != null
+          ? Math.max(
+              0,
+              Math.round(departAbs - prevRideArrive - (seg.accessMin ?? 0)),
+            )
+          : null;
+      if (waitMin != null) totalWaitMin += waitMin;
       if (rideCount === 0) {
         boardAt = departAbs;
         boardAtSched = schedAbs;
@@ -284,7 +308,9 @@ export function computePlans(
         arrive,
         delayMin: segDelay,
         suspended: isSuspended(segStatus),
+        waitMin,
       });
+      prevRideArrive = arrive;
       cur = arrive;
     }
     if (rideCount === 0) return null;
@@ -296,6 +322,7 @@ export function computePlans(
       arriveAt: cur,
       toPlatformMin: toPlatform,
       nextDay: firstSchedAbs >= 1440,
+      totalWaitMin,
     };
   };
 
@@ -322,6 +349,91 @@ export function computePlans(
     return { ...base, options: opt ? [opt] : [], endOfService: true };
   }
   return { ...base, endOfService: true };
+}
+
+export interface Scenario {
+  id: string;
+  /** Short label, e.g. 最短 / なんばで1本見送る. */
+  label: string;
+  /** What choice defines this scenario. */
+  description: string;
+  plan: PlanOption;
+  /** Ride segment whose departure choice differs; null for the baseline. */
+  skipSegmentId: number | null;
+}
+
+/**
+ * Compare complete traversals of the route from the current position:
+ * the fastest chain (board the earliest catchable train at every
+ * station) against variants that pass up ONE departure at a single
+ * boarding point and re-simulate everything downstream from there.
+ * That is what makes the classic trade-off visible: a locally faster
+ * connection that strands you at the last transfer shows a long final
+ * wait and the same (or worse) arrival, while passing up a train
+ * early can keep the same final arrival with less rushing.
+ *
+ * Implementation: each variant re-runs computePlans on a copy of the
+ * route with the baseline's caught departure removed from that one
+ * segment's list, so the engine itself stays the single source of
+ * truth for chaining, delays and walking times.
+ */
+export function computeScenarios(
+  route: RouteLike,
+  dayType: DayType,
+  statuses: Map<string, StatusLike>,
+  nowMin: number,
+  startIndex: number,
+): Scenario[] {
+  const base = computePlans(route, dayType, statuses, nowMin, startIndex);
+  const baseline = base.options[0];
+  if (!baseline || base.firstRideSuspended) return [];
+  const out: Scenario[] = [
+    {
+      id: "fastest",
+      label: "最短（乗れる電車にすぐ乗り継ぐ）",
+      description: "各駅で最初に乗れる電車に乗り継いだ場合",
+      plan: baseline,
+      skipSegmentId: null,
+    },
+  ];
+  const signature = (p: PlanOption): string =>
+    p.legs
+      .filter((l) => l.kind === "ride")
+      .map((l) => `${l.segmentId}:${l.depart}`)
+      .join("|") + `@${p.arriveAt}`;
+  const seen = new Set([signature(baseline)]);
+  for (const leg of baseline.legs) {
+    if (out.length >= 5) break;
+    if (leg.kind !== "ride" || leg.schedDepart == null) continue;
+    const seg = route.segments.find((s) => s.id === leg.segmentId);
+    if (!seg) continue;
+    const depMin = ((leg.schedDepart % 1440) + 1440) % 1440;
+    const variantRoute: RouteLike = {
+      ...route,
+      segments: route.segments.map((s) => {
+        if (s.id !== seg.id) return s;
+        return dayType === "weekday"
+          ? { ...s, departuresWeekday: s.departuresWeekday.filter((d) => d !== depMin) }
+          : { ...s, departuresHoliday: s.departuresHoliday.filter((d) => d !== depMin) };
+      }),
+    };
+    const variant = computePlans(variantRoute, dayType, statuses, nowMin, startIndex)
+      .options[0];
+    if (!variant) continue;
+    const sig = signature(variant);
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    const station = leg.fromStation;
+    const stationLabel = station.endsWith("駅") ? station : `${station}駅`;
+    out.push({
+      id: `skip-${seg.id}`,
+      label: `${station}で1本見送る`,
+      description: `${leg.line ?? ""} ${stationLabel}で ${fmtTime(leg.schedDepart)}発を見送り、次に乗った場合`,
+      plan: variant,
+      skipSegmentId: seg.id,
+    });
+  }
+  return out;
 }
 
 export type Direction = "outbound" | "return";
