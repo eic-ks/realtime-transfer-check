@@ -4,6 +4,8 @@ import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
 import {
 applyTimetables,
+applyTrainData,
+computeFocusChoices,
 computePlans,
 computeScenarios,
 detectDirection,
@@ -14,11 +16,17 @@ haversineM,
 nowJst,
 reversedRoute,
 routePoints,
+stationCore,
+stationCoreLooseEq,
 timetableKey,
+trainDetailKey,
 walkMinutes,
 type DayType,
 type Direction,
 type PlanOption,
+type RouteLike,
+type TrainStopLike,
+type TransferOption,
 } from "./lib/predict";
 import {
 RouteEditor,
@@ -126,6 +134,20 @@ export function App() {
     mutationFn: (args: { line: string; station: string; toward: string }) =>
       api.fetchTimetable(args),
     onSuccess: invalidate,
+  });
+  const fetchTrainTimetableMut = useMutation({
+    mutationFn: (args: { line: string; station: string; toward: string }) =>
+      api.fetchTrainTimetable(args),
+    onSuccess: invalidate,
+  });
+  const fetchTrainDetailsMut = useMutation({
+    mutationFn: (args: {
+      line: string;
+      station: string;
+      toward: string;
+      dayType: DayType;
+      departs: number[];
+    }) => api.fetchTrainDetails(args),
   });
 
   const [refreshingLine, setRefreshingLine] = useState<string | null>(null);
@@ -251,6 +273,18 @@ export function App() {
             onFetchTimetable={(line, station, toward) =>
               fetchTimetableMut.mutateAsync({ line, station, toward })
             }
+            onFetchTrainTimetable={(line, station, toward) =>
+              fetchTrainTimetableMut.mutateAsync({ line, station, toward })
+            }
+            onFetchTrainDetails={(line, station, toward, dayType, departs) =>
+              fetchTrainDetailsMut.mutateAsync({
+                line,
+                station,
+                toward,
+                dayType,
+                departs,
+              })
+            }
             onGoRoutes={() => setView("routes")}
           />
         )}
@@ -296,6 +330,8 @@ function BoardView({
   onRefreshLine,
   onManualDelay,
   onFetchTimetable,
+  onFetchTrainTimetable,
+  onFetchTrainDetails,
   onGoRoutes,
 }: {
   data: State;
@@ -314,6 +350,34 @@ function BoardView({
     station: string,
     toward: string,
   ) => Promise<{ ok: boolean; message: string | null }>;
+  onFetchTrainTimetable: (
+    line: string,
+    station: string,
+    toward: string,
+  ) => Promise<{
+    ok: boolean;
+    message: string | null;
+    weekday: { depart: number; type: string; dest: string }[];
+    holiday: { depart: number; type: string; dest: string }[];
+    sourceUrl: string | null;
+    sourceTitle: string | null;
+  }>;
+  onFetchTrainDetails: (
+    line: string,
+    station: string,
+    toward: string,
+    dayType: DayType,
+    departs: number[],
+  ) => Promise<{
+    ok: boolean;
+    message: string | null;
+    details: {
+      depart: number;
+      type: string;
+      dest: string;
+      stops: TrainStopLike[];
+    }[];
+  }>;
   onGoRoutes: () => void;
 }) {
   const now = nowJst();
@@ -322,6 +386,7 @@ function BoardView({
   const [positionIdx, setPositionIdx] = useState(0);
   const [selectedOption, setSelectedOption] = useState(0);
   const [selectedScenarioId, setSelectedScenarioId] = useState<string | null>(null);
+  const [selectedChoiceId, setSelectedChoiceId] = useState<string | null>(null);
   const [gps, setGps] = useState<{ lat: number; lng: number } | null>(null);
   const [gpsNote, setGpsNote] = useState<string | null>(null);
   // Direction: manual correction wins; then the server-stored detection;
@@ -352,6 +417,7 @@ function BoardView({
     setPositionIdx(0);
     setSelectedOption(0);
     setSelectedScenarioId(null);
+    setSelectedChoiceId(null);
     setGps(null);
     setGpsNote(null);
     setManualDir(null);
@@ -365,6 +431,7 @@ function BoardView({
     setPositionIdx(0);
     setSelectedOption(0);
     setSelectedScenarioId(null);
+    setSelectedChoiceId(null);
   }, [dir]);
 
   // Keep watching the position while the board is open: direction
@@ -523,18 +590,370 @@ function BoardView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [missingTimetables]);
 
-  const planRoute: Route | null = useMemo(() => {
-    if (!ttRoute) return null;
-    if (!gpsInfo) return ttRoute;
+  // ---- per-train data (type / destination / stop pattern) ----
+  // Rail segments additionally fetch the per-train timetable from
+  // ekitan: without it the board can only reason about departure
+  // minutes, never about 特急 vs 普通, real arrival times, or
+  // mid-segment transfers. Failures are silent here — the segment
+  // simply stays on the minutes-only model (bus GTFS segments and
+  // user-registered timetables have no per-train source).
+  type TrainTT = {
+    weekday: { depart: number; type: string; dest: string }[];
+    holiday: { depart: number; type: string; dest: string }[];
+    sourceUrl: string | null;
+    sourceTitle: string | null;
+  };
+  const [trainTTs, setTrainTTs] = useState<Record<string, TrainTT>>({});
+  // fetchTrainTT is called concurrently (one exploration per boarded
+  // train, all needing the same intermediate stations' timetables),
+  // so results and in-flight requests are shared through refs: a
+  // caller must never be turned away just because another caller is
+  // already fetching the same station — that once silently starved
+  // every transfer exploration after the first.
+  const trainTTsRef = useRef<Record<string, TrainTT>>({});
+  const trainTTInflightRef = useRef<Map<string, Promise<TrainTT | null>>>(
+    new Map(),
+  );
+  const fetchTrainTT = (
+    line: string,
+    station: string,
+    toward: string,
+  ): Promise<TrainTT | null> => {
+    const key = timetableKey(line, station, toward);
+    const have = trainTTsRef.current[key];
+    if (have) return Promise.resolve(have);
+    const inflight = trainTTInflightRef.current.get(key);
+    if (inflight) return inflight;
+    const p = (async (): Promise<TrainTT | null> => {
+      try {
+        const res = await onFetchTrainTimetable(line, station, toward);
+        if (!res.ok || res.weekday.length === 0) return null;
+        const tt: TrainTT = {
+          weekday: res.weekday,
+          holiday: res.holiday,
+          sourceUrl: res.sourceUrl,
+          sourceTitle: res.sourceTitle,
+        };
+        trainTTsRef.current = { ...trainTTsRef.current, [key]: tt };
+        setTrainTTs(trainTTsRef.current);
+        return tt;
+      } catch {
+        return null;
+      } finally {
+        trainTTInflightRef.current.delete(key);
+      }
+    })();
+    trainTTInflightRef.current.set(key, p);
+    return p;
+  };
+  useEffect(() => {
+    if (!displayRoute) return;
+    for (const seg of displayRoute.segments) {
+      if (seg.type !== "ride" || !seg.line) continue;
+      void fetchTrainTT(
+        seg.line,
+        seg.station ?? seg.fromLabel,
+        seg.toLabel,
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [displayRoute]);
+
+  const [trainDetails, setTrainDetails] = useState<
+    Map<string, TrainStopLike[]>
+  >(new Map());
+  const detailAttemptedRef = useRef<Set<string>>(new Set());
+  const fetchDetailsFor = async (
+    line: string,
+    station: string,
+    toward: string,
+    departs: number[],
+  ): Promise<void> => {
+    const missing = departs.filter(
+      (d) =>
+        !detailAttemptedRef.current.has(
+          trainDetailKey(line, station, toward, dayType, d),
+        ),
+    );
+    if (missing.length === 0) return;
+    for (const d of missing) {
+      detailAttemptedRef.current.add(
+        trainDetailKey(line, station, toward, dayType, d),
+      );
+    }
+    try {
+      const res = await onFetchTrainDetails(
+        line,
+        station,
+        toward,
+        dayType,
+        missing.slice(0, 10),
+      );
+      if (!res.ok) return;
+      setTrainDetails((prev) => {
+        const next = new Map(prev);
+        for (const det of res.details) {
+          next.set(
+            trainDetailKey(line, station, toward, dayType, det.depart),
+            det.stops,
+          );
+        }
+        return next;
+      });
+    } catch {
+      // details stay unfetched; rideMin estimates keep working
+    }
+  };
+
+  // Fetch stop lists for the trains the board is likely to use:
+  // around each ride leg of the current fastest plan, the caught
+  // train plus the next few departures of that segment.
+  const detailSeed = useMemo(() => {
+    if (!ttRoute) return "";
+    const base = computePlans(
+      ttRoute,
+      dayType,
+      statuses,
+      now.minutesFloat,
+      positionIdx,
+    );
+    const parts: string[] = [];
+    for (const leg of base.options[0]?.legs ?? []) {
+      if (leg.kind !== "ride" || leg.schedDepart == null) continue;
+      const seg = ttRoute.segments.find((s) => s.id === leg.segmentId);
+      if (!seg?.line) continue;
+      const station = seg.station ?? seg.fromLabel;
+      const key = timetableKey(seg.line, station, seg.toLabel);
+      const tt = trainTTs[key];
+      if (!tt) continue;
+      const list = dayType === "weekday" ? tt.weekday : tt.holiday;
+      const depMod = ((leg.schedDepart % 1440) + 1440) % 1440;
+      const idx = list.findIndex((t) => t.depart >= depMod);
+      const cand = (idx >= 0 ? list.slice(idx, idx + 4) : []).map(
+        (t) => t.depart,
+      );
+      if (cand.length > 0) {
+        parts.push(
+          `${seg.line}|${station}|${seg.toLabel}|${cand.join(",")}`,
+        );
+      }
+    }
+    return parts.join(";");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ttRoute, dayType, trainTTs, positionIdx]);
+  useEffect(() => {
+    if (!detailSeed) return;
+    for (const part of detailSeed.split(";")) {
+      const [line, station, toward, deps] = part.split("|");
+      if (!line || !station || !toward || !deps) continue;
+      void fetchDetailsFor(
+        line,
+        station,
+        toward,
+        deps.split(",").map(Number),
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detailSeed]);
+
+  const trainRoute: RouteLike | null = useMemo(
+    () =>
+      ttRoute
+        ? applyTrainData(
+            ttRoute,
+            Object.entries(trainTTs).map(([key, tt]) => {
+              const seg = ttRoute.segments.find(
+                (s) =>
+                  s.type === "ride" &&
+                  s.line &&
+                  timetableKey(
+                    s.line,
+                    s.station ?? s.fromLabel,
+                    s.toLabel,
+                  ) === key,
+              );
+              return {
+                line: seg?.line ?? "",
+                station: seg?.station ?? seg?.fromLabel ?? "",
+                toward: seg?.toLabel ?? "",
+                weekday: tt.weekday,
+                holiday: tt.holiday,
+              };
+            }),
+            trainDetails,
+          )
+        : null,
+    [ttRoute, trainTTs, trainDetails],
+  );
+
+  // ---- mid-segment transfer options (first ride segment) ----
+  // For each catchable train of the first ride, look at its stopping
+  // stations: at a station where a faster train of the same line
+  // also stops and arrives at the destination earlier, changing
+  // there is a real option. Computed from fetched stop lists only.
+  const [transferOptionsMap, setTransferOptionsMap] = useState<
+    Record<number, TransferOption[]>
+  >({});
+  const transferAttemptedRef = useRef<Set<string>>(new Set());
+  // Boards whose transfer exploration has finished (with or without
+  // a found option); the "no combination" note waits for these.
+  const [transferDone, setTransferDone] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    if (!trainRoute) return;
+    const firstRideIdx = trainRoute.segments.findIndex(
+      (s, i) => i >= positionIdx && s.type === "ride",
+    );
+    const seg =
+      firstRideIdx >= 0 ? trainRoute.segments[firstRideIdx] : undefined;
+    if (!seg?.line) return;
+    const station = seg.station ?? seg.fromLabel;
+    const trains =
+      dayType === "weekday" ? seg.trainsWeekday : seg.trainsHoliday;
+    if (!trains || trains.length === 0) return;
+    let toPlatform = 0;
+    for (let i = positionIdx; i < firstRideIdx; i++) {
+      const s = trainRoute.segments[i];
+      if (s && s.type === "walk") toPlatform += walkMinutes(s) ?? 0;
+    }
+    toPlatform += seg.accessMin ?? 0;
+    const st = statuses.get(seg.line);
+    const delay = st
+      ? st.manualDelayMin ?? (st.status === "normal" ? 0 : (st.delayMin ?? 0))
+      : 0;
+    const need = now.minutesFloat + toPlatform + trainRoute.bufferMin;
+    const candidates = trains
+      .filter((t) => t.servesDest !== false && t.depart + delay >= need)
+      .slice(0, 3);
+    const segLine = seg.line;
+    const segToward = seg.toLabel;
+    const segId = seg.id;
+    for (const board of candidates) {
+      const attemptKey = `${segId}|${dayType}|${board.depart}`;
+      if (transferAttemptedRef.current.has(attemptKey)) continue;
+      const stops = trainDetails.get(
+        trainDetailKey(segLine, station, segToward, dayType, board.depart),
+      );
+      if (!stops) continue; // detail not fetched yet; retry when it lands
+      transferAttemptedRef.current.add(attemptKey);
+      void (async () => {
+        try {
+        const destCore = stationCore(segToward);
+        const bi = stops.findIndex((s) =>
+          stationCoreLooseEq(stationCore(s.station), stationCore(station)),
+        );
+        const ai = stops.findIndex((s) =>
+          stationCoreLooseEq(stationCore(s.station), destCore),
+        );
+        if (bi < 0 || ai <= bi) return;
+        const destStop = stops[ai];
+        const directArrive = destStop?.arrive ?? destStop?.depart ?? null;
+        if (directArrive == null) return;
+        const vias = stops.slice(bi + 1, ai).slice(0, 6);
+        const found: TransferOption[] = [];
+        for (const via of vias) {
+          const localArrive = via.arrive ?? via.depart;
+          if (localArrive == null) continue;
+          const viaStation = stationCore(via.station);
+          const tt = await fetchTrainTT(segLine, viaStation, segToward);
+          if (!tt) continue;
+          const viaList = dayType === "weekday" ? tt.weekday : tt.holiday;
+          // Same-platform style change: allow 1 minute at the station.
+          const expressCands = viaList
+            .filter(
+              (t) =>
+                t.depart >= localArrive + 1 && t.depart <= localArrive + 30,
+            )
+            .slice(0, 3);
+          if (expressCands.length === 0) continue;
+          await fetchDetailsFor(
+            segLine,
+            viaStation,
+            segToward,
+            expressCands.map((t) => t.depart),
+          );
+          // Details arrive via state; read them back with a fresh call
+          // pattern: request again (attempted set makes this cheap)
+          // and use the action result directly instead.
+          try {
+            const res = await onFetchTrainDetails(
+              segLine,
+              viaStation,
+              segToward,
+              dayType,
+              expressCands.map((t) => t.depart),
+            );
+            if (!res.ok) continue;
+            for (const det of res.details) {
+              const dStop = det.stops.find((s) =>
+                stationCoreLooseEq(stationCore(s.station), destCore),
+              );
+              const arr = dStop?.arrive ?? dStop?.depart ?? null;
+              if (arr == null || arr >= directArrive) continue;
+              const candTrain = expressCands.find(
+                (t) => t.depart === det.depart,
+              );
+              found.push({
+                boardDepart: board.depart,
+                boardType: board.type,
+                viaStation,
+                localArriveVia: localArrive,
+                expressDepart: det.depart,
+                expressType: det.type || candTrain?.type || "",
+                expressDest: det.dest || candTrain?.dest || "",
+                arriveDest: arr,
+              });
+            }
+          } catch {
+            // this via station simply yields no option
+          }
+        }
+        if (found.length > 0) {
+          setTransferOptionsMap((prev) => {
+            const cur = prev[segId] ?? [];
+            const merged = [
+              ...cur.filter((o) => o.boardDepart !== board.depart),
+              ...found,
+            ];
+            return { ...prev, [segId]: merged };
+          });
+        }
+        } finally {
+          setTransferDone((prev) => {
+            if (prev.has(attemptKey)) return prev;
+            const next = new Set(prev);
+            next.add(attemptKey);
+            return next;
+          });
+        }
+      })();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trainRoute, trainDetails, dayType, positionIdx]);
+
+  const enrichedRoute: RouteLike | null = useMemo(() => {
+    if (!trainRoute) return null;
     return {
-      ...ttRoute,
-      segments: ttRoute.segments.map((s) =>
+      ...trainRoute,
+      segments: trainRoute.segments.map((s) =>
+        transferOptionsMap[s.id]
+          ? { ...s, transferOptions: transferOptionsMap[s.id] }
+          : s,
+      ),
+    };
+  }, [trainRoute, transferOptionsMap]);
+
+  const planRoute: RouteLike | null = useMemo(() => {
+    if (!enrichedRoute) return null;
+    if (!gpsInfo) return enrichedRoute;
+    return {
+      ...enrichedRoute,
+      segments: enrichedRoute.segments.map((s) =>
         s.id === gpsInfo.walkSegmentId
           ? { ...s, learnedWalkMin: gpsInfo.correctedMin }
           : s,
       ),
     };
-  }, [ttRoute, gpsInfo]);
+  }, [enrichedRoute, gpsInfo]);
 
   const plan = useMemo(() => {
     if (!planRoute) return null;
@@ -553,6 +972,22 @@ function BoardView({
   const scenarios = useMemo(() => {
     if (!planRoute) return [];
     return computeScenarios(
+      planRoute,
+      dayType,
+      statuses,
+      now.minutesFloat,
+      positionIdx,
+    );
+  }, [planRoute, dayType, statuses, now.minutesFloat, positionIdx]);
+
+  // Focus choices: the trains connectable from this moment at the
+  // first boarding point — for each, 乗り換える (mid-segment change
+  // onto a faster train) vs 乗り換えない (stay through), and the
+  // same for departing one train later. Each choice re-simulates
+  // the whole route to the final arrival.
+  const focusChoices = useMemo(() => {
+    if (!planRoute) return [];
+    return computeFocusChoices(
       planRoute,
       dayType,
       statuses,
@@ -632,7 +1067,10 @@ function BoardView({
     plan.options[selectedOption] ?? plan.options[0];
   const selectedScenario =
     scenarios.find((s) => s.id === selectedScenarioId) ?? null;
-  const shownPlan: PlanOption | undefined = selectedScenario?.plan ?? main;
+  const selectedChoice =
+    focusChoices.find((c) => c.id === selectedChoiceId) ?? null;
+  const shownPlan: PlanOption | undefined =
+    selectedChoice?.plan ?? selectedScenario?.plan ?? main;
   const baselinePlan = scenarios[0]?.plan ?? null;
   const baselineLegs = new Map(
     (baselinePlan?.legs ?? [])
@@ -847,6 +1285,31 @@ function BoardView({
         )}
         {shownPlan && firstRideSeg && (
           <div>
+            {selectedChoice && (
+              <p className="mb-2 flex flex-wrap items-center gap-2">
+                <span className="rounded bg-[#3d2c07] px-1.5 py-0.5 text-xs font-bold text-[#fbbf24]">
+                  選択中: {fmtTime(selectedChoice.boardDepart)}発
+                  {selectedChoice.boardType
+                    ? ` ${selectedChoice.boardType}`
+                    : ""}
+                  {selectedChoice.mode === "transfer"
+                    ? ` → ${selectedChoice.viaStation}で${selectedChoice.expressType ?? ""}に乗り換え`
+                    : selectedChoice.mode === "stay"
+                      ? " → 乗り換えず直通"
+                      : ""}
+                  {selectedChoice.laterBy > 0
+                    ? `（${selectedChoice.laterBy}本遅らせ）`
+                    : ""}
+                </span>
+                <button
+                  type="button"
+                  className="text-xs font-bold text-[var(--dim)] underline"
+                  onClick={() => setSelectedChoiceId(null)}
+                >
+                  最短に戻す
+                </button>
+              </p>
+            )}
             {selectedScenario && selectedScenario.id !== "fastest" && (
               <p className="mb-2 flex flex-wrap items-center gap-2">
                 <span className="rounded bg-[#3d2c07] px-1.5 py-0.5 text-xs font-bold text-[#fbbf24]">
@@ -960,10 +1423,69 @@ function BoardView({
                             </span>
                           )}
                         </p>
+                      ) : leg.transferWithin ? (
+                        <div>
+                          <p>
+                            <span className="font-bold">{leg.line}</span>{" "}
+                            {leg.trainType && (
+                              <span className="mr-1 rounded bg-[var(--surface2)] px-1 py-0.5 text-[11px] font-bold">
+                                {leg.trainType}
+                              </span>
+                            )}
+                            {leg.fromStation}
+                            <span className="tnum ml-2 font-bold">
+                              {leg.depart != null ? fmtTime(leg.depart) : ""}発
+                            </span>
+                            <span className="text-[var(--dim)]"> → </span>
+                            {leg.transferWithin.viaStation}
+                            <span className="tnum ml-1.5">
+                              {fmtTime(leg.transferWithin.localArriveVia)}着
+                            </span>
+                          </p>
+                          <p className="mt-0.5">
+                            <span className="rounded bg-[#123c26] px-1 py-0.5 text-[11px] font-bold text-[#4ade80]">
+                              {leg.transferWithin.viaStation}で乗り換え
+                            </span>{" "}
+                            <span className="font-bold">
+                              {leg.transferWithin.expressType}
+                            </span>
+                            {leg.transferWithin.expressDest
+                              ? ` ${leg.transferWithin.expressDest}行き`
+                              : ""}
+                            <span className="tnum ml-2 font-bold">
+                              {fmtTime(leg.transferWithin.expressDepart)}発
+                            </span>
+                            <span className="text-[var(--dim)]"> → </span>
+                            {leg.toStation}
+                            <span className="tnum ml-1.5 font-bold">
+                              {leg.arrive != null ? fmtTime(leg.arrive) : ""}着
+                            </span>
+                            {leg.delayMin > 0 && (
+                              <span className="ml-1.5 text-xs font-bold text-[#fbbf24]">
+                                +{leg.delayMin}分
+                              </span>
+                            )}
+                          </p>
+                          {waitMin != null && (
+                            <span className="block text-xs text-[var(--dim)]">
+                              乗り換え待ち 約{waitMin}分
+                            </span>
+                          )}
+                        </div>
                       ) : (
                         <p>
                           <span className="font-bold">{leg.line}</span>{" "}
+                          {leg.trainType && (
+                            <span className="mr-1 rounded bg-[var(--surface2)] px-1 py-0.5 text-[11px] font-bold">
+                              {leg.trainType}
+                            </span>
+                          )}
                           {leg.fromStation} → {leg.toStation}
+                          {leg.trainDest && (
+                            <span className="ml-1 text-xs text-[var(--dim)]">
+                              {leg.trainDest}行き
+                            </span>
+                          )}
                           <span className="tnum ml-2 font-bold">
                             {leg.depart != null ? fmtTime(leg.depart) : ""}発 →{" "}
                             {leg.arrive != null ? fmtTime(leg.arrive) : ""}着
@@ -1011,6 +1533,7 @@ function BoardView({
                   type="button"
                   onClick={() => {
                     setSelectedScenarioId(null);
+                    setSelectedChoiceId(null);
                     setSelectedOption(i);
                   }}
                   className="tnum flex w-full items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-left text-sm"
@@ -1023,6 +1546,294 @@ function BoardView({
               ),
             )}
           </div>
+        </section>
+      )}
+
+      {/* 乗り換えの選択（特急まで考慮） */}
+      {focusChoices.length > 0 && firstRideSeg && (
+        <section aria-label="乗り換えの選択" className="mt-5">
+          <h2 className="text-xs font-bold text-[var(--dim)]">
+            乗り換えの選択（{stationLabel(firstRideSeg.station ?? firstRideSeg.fromLabel)}から乗れる電車）
+          </h2>
+          <p className="mt-1 text-xs leading-relaxed text-[var(--dim)]">
+            いまから乗り継げる電車ごとに、途中の駅で速い電車（特急・快速など）に「乗り換える」か、そのまま「乗り換えない」かを切り替えて、その先の駅で乗れる電車と最終到着がどう変わるか比べられます。出発を1本遅らせた場合も同じ見方です。
+          </p>
+          {(() => {
+            const groups: {
+              depart: number;
+              type: string | null;
+              dest: string | null;
+              laterBy: number;
+              choices: typeof focusChoices;
+            }[] = [];
+            for (const c of focusChoices) {
+              let g = groups.find((x) => x.depart === c.boardDepart);
+              if (!g) {
+                g = {
+                  depart: c.boardDepart,
+                  type: c.boardType,
+                  dest: c.boardDest,
+                  laterBy: c.laterBy,
+                  choices: [],
+                };
+                groups.push(g);
+              }
+              g.choices.push(c);
+            }
+            const selGroup =
+              groups.find((g) =>
+                g.choices.some((c) => c.id === selectedChoice?.id),
+              ) ?? groups[0];
+            const selChoice =
+              selGroup?.choices.find((c) => c.id === selectedChoice?.id) ??
+              selGroup?.choices[0];
+            const fastestArrive = Math.min(
+              ...focusChoices.map((c) => c.plan.arriveAt),
+            );
+            const hasTrainData = focusChoices.some(
+              (c) => c.boardType != null,
+            );
+            const anyTransfer = focusChoices.some(
+              (c) => c.mode === "transfer",
+            );
+            return (
+              <div className="mt-2">
+                {/* 出発のタブ */}
+                <div
+                  className="flex flex-wrap gap-1.5"
+                  role="tablist"
+                  aria-label="出発する電車の選択"
+                >
+                  {groups.map((g) => {
+                    const active = selGroup?.depart === g.depart;
+                    return (
+                      <button
+                        key={g.depart}
+                        type="button"
+                        role="tab"
+                        aria-selected={active}
+                        onClick={() => {
+                          const def =
+                            g.choices.find((c) => c.mode === "transfer") ??
+                            g.choices[0];
+                          if (def) {
+                            setSelectedScenarioId(null);
+                            setSelectedChoiceId(def.id);
+                          }
+                        }}
+                        className={`tnum rounded-lg border px-3 py-2 text-left text-sm ${
+                          active
+                            ? "border-[var(--accent)] bg-[#123c26] text-[#4ade80]"
+                            : "border-[var(--border)] bg-[var(--surface)] text-[var(--dim)]"
+                        }`}
+                      >
+                        <span className="font-bold">
+                          {fmtTime(g.depart)}発
+                        </span>
+                        {g.type && (
+                          <span className="ml-1.5 font-bold">{g.type}</span>
+                        )}
+                        {g.dest && (
+                          <span className="ml-1 text-xs">{g.dest}行き</span>
+                        )}
+                        {g.laterBy > 0 && (
+                          <span className="ml-1.5 rounded bg-[#3d2c07] px-1 py-0.5 text-[11px] font-bold text-[#fbbf24]">
+                            {g.laterBy}本遅らせる
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+                {/* 乗り換える／乗り換えないのタブ */}
+                {selGroup && selGroup.choices.length > 1 && (
+                  <div
+                    className="mt-2 grid grid-cols-2 gap-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] p-1"
+                    role="tablist"
+                    aria-label="途中で乗り換えるかの選択"
+                  >
+                    {selGroup.choices.map((c) => {
+                      const active = selChoice?.id === c.id;
+                      return (
+                        <button
+                          key={c.id}
+                          type="button"
+                          role="tab"
+                          aria-selected={active}
+                          onClick={() => {
+                            setSelectedScenarioId(null);
+                            setSelectedChoiceId(c.id);
+                          }}
+                          className={`rounded-md px-2 py-2 text-sm font-black ${
+                            active
+                              ? "bg-[var(--accent)] text-[#0b2013]"
+                              : "text-[var(--dim)]"
+                          }`}
+                        >
+                          {c.mode === "transfer"
+                            ? `${c.viaStation}で乗り換える`
+                            : "乗り換えない"}
+                          <span className="block text-[11px] font-bold opacity-80">
+                            {c.mode === "transfer"
+                              ? `${c.expressType ?? ""}に乗り換え`
+                              : "直通・座ったまま"}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+                {/* 選択中の選択肢の結果 */}
+                {selChoice && (
+                  <div className="mt-2 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-3">
+                    <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5">
+                      <p className="text-sm font-black">
+                        {fmtTime(selChoice.boardDepart)}発
+                        {selChoice.boardType
+                          ? ` ${selChoice.boardType}`
+                          : ""}
+                        {selChoice.mode === "transfer"
+                          ? ` → ${selChoice.viaStation}で${selChoice.expressType ?? ""}に乗り換え`
+                          : selChoice.mode === "stay"
+                            ? " → 乗り換えず直通"
+                            : ""}
+                      </p>
+                      <p className="tnum text-sm">
+                        <span className="mr-1 text-xs text-[var(--dim)]">
+                          最終到着
+                        </span>
+                        <span className="text-lg font-bold">
+                          {fmtTime(selChoice.plan.arriveAt)}
+                        </span>
+                        {Math.round(selChoice.plan.arriveAt - fastestArrive) >
+                          0 && (
+                          <span className="ml-1.5 rounded bg-[#3d2c07] px-1.5 py-0.5 text-[11px] font-bold text-[#fbbf24]">
+                            最速より +
+                            {Math.round(
+                              selChoice.plan.arriveAt - fastestArrive,
+                            )}
+                            分
+                          </span>
+                        )}
+                      </p>
+                    </div>
+                    <p className="mt-0.5 text-xs text-[var(--dim)]">
+                      乗り換え待ち合計 {selChoice.plan.totalWaitMin}分
+                    </p>
+                    <ol className="mt-2 space-y-1.5">
+                      {selChoice.plan.legs
+                        .filter((l) => l.kind === "ride")
+                        .map((leg) => (
+                          <li key={leg.segmentId} className="text-sm">
+                            {leg.waitMin != null && (
+                              <span
+                                className={`mb-0.5 inline-block rounded px-1.5 py-0.5 text-[11px] font-bold ${
+                                  leg.waitMin >= 10
+                                    ? "bg-[#3d2c07] text-[#fbbf24]"
+                                    : "bg-[var(--surface2)] text-[var(--dim)]"
+                                }`}
+                              >
+                                {leg.fromStation}で待ち {leg.waitMin}分
+                              </span>
+                            )}
+                            <p>
+                              <span className="font-bold">{leg.line}</span>{" "}
+                              {leg.trainType && (
+                                <span className="mr-1 rounded bg-[var(--surface2)] px-1 py-0.5 text-[11px] font-bold">
+                                  {leg.trainType}
+                                </span>
+                              )}
+                              {leg.fromStation}
+                              <span className="tnum ml-1.5 font-bold">
+                                {leg.depart != null
+                                  ? fmtTime(leg.depart)
+                                  : ""}
+                                発
+                              </span>
+                              {leg.transferWithin ? (
+                                <>
+                                  <span className="text-[var(--dim)]">
+                                    {" "}
+                                    →{" "}
+                                  </span>
+                                  {leg.transferWithin.viaStation}
+                                  <span className="tnum ml-1">
+                                    {fmtTime(
+                                      leg.transferWithin.localArriveVia,
+                                    )}
+                                    着
+                                  </span>
+                                  <span className="ml-1 rounded bg-[#123c26] px-1 py-0.5 text-[11px] font-bold text-[#4ade80]">
+                                    {leg.transferWithin.expressType}
+                                    に乗り換え{" "}
+                                    {fmtTime(leg.transferWithin.expressDepart)}
+                                    発
+                                  </span>
+                                </>
+                              ) : null}
+                              <span className="text-[var(--dim)]"> → </span>
+                              {leg.toStation}
+                              <span className="tnum ml-1.5">
+                                {leg.arrive != null
+                                  ? fmtTime(leg.arrive)
+                                  : ""}
+                                着
+                              </span>
+                            </p>
+                          </li>
+                        ))}
+                    </ol>
+                    <button
+                      type="button"
+                      disabled={selectedChoice?.id === selChoice.id}
+                      onClick={() => {
+                        setSelectedScenarioId(null);
+                        setSelectedChoiceId(selChoice.id);
+                      }}
+                      className={`mt-2 rounded-lg border px-3 py-1.5 text-xs font-bold ${
+                        selectedChoice?.id === selChoice.id
+                          ? "border-[var(--accent)] text-[#4ade80]"
+                          : "border-[var(--border)] text-[var(--dim)]"
+                      }`}
+                    >
+                      {selectedChoice?.id === selChoice.id
+                        ? "この選択を表示中（上の発車案内に反映）"
+                        : "この選択で表示"}
+                    </button>
+                  </div>
+                )}
+                {!hasTrainData && (
+                  <p className="mt-2 text-xs leading-relaxed text-[var(--dim)]">
+                    この区間は列車ごとの種別データ（駅探の列車別時刻表）が取得できていないため、途中の乗り換え判定はできません。出発を遅らせる比較のみ表示しています（バスのGTFS区間と登録済み時刻表の区間も同様です）。
+                  </p>
+                )}
+                {hasTrainData &&
+                  !anyTransfer &&
+                  (() => {
+                    const boards = [
+                      ...new Set(focusChoices.map((c) => c.boardDepart)),
+                    ];
+                    const done =
+                      firstRideSeg != null &&
+                      boards.length > 0 &&
+                      boards.every((d) =>
+                        transferDone.has(
+                          `${firstRideSeg.id}|${dayType}|${d}`,
+                        ),
+                      );
+                    return done ? (
+                      <p className="mt-2 text-xs leading-relaxed text-[var(--dim)]">
+                        いま乗り継げる電車では、途中の駅で速い電車に乗り換えても降車駅への到着が早くなる組み合わせはありませんでした（各電車の停車駅と到着時刻で判定）。
+                      </p>
+                    ) : (
+                      <p className="mt-2 text-xs leading-relaxed text-[var(--dim)]">
+                        途中の駅で速い電車に乗り換えられる組み合わせを確認中…
+                      </p>
+                    );
+                  })()}
+              </div>
+            );
+          })()}
         </section>
       )}
 
@@ -1107,6 +1918,11 @@ function BoardView({
                             )}
                             <p>
                               <span className="font-bold">{leg.line}</span>{" "}
+                              {leg.trainType && (
+                                <span className="mr-1 rounded bg-[var(--surface2)] px-1 py-0.5 text-[11px] font-bold">
+                                  {leg.trainType}
+                                </span>
+                              )}
                               {leg.fromStation}
                               <span
                                 className={`tnum ml-1.5 font-bold ${
@@ -1121,6 +1937,19 @@ function BoardView({
                                   {diff}分）
                                 </span>
                               )}
+                              {leg.transferWithin ? (
+                                <>
+                                  <span className="text-[var(--dim)]"> → </span>
+                                  {leg.transferWithin.viaStation}
+                                  <span className="tnum ml-1">
+                                    {fmtTime(leg.transferWithin.localArriveVia)}着
+                                  </span>
+                                  <span className="ml-1 rounded bg-[#123c26] px-1 py-0.5 text-[11px] font-bold text-[#4ade80]">
+                                    {leg.transferWithin.expressType}に乗り換え{" "}
+                                    {fmtTime(leg.transferWithin.expressDepart)}発
+                                  </span>
+                                </>
+                              ) : null}
                               <span className="text-[var(--dim)]"> → </span>
                               {leg.toStation}
                               <span className="tnum ml-1.5">
@@ -1134,7 +1963,10 @@ function BoardView({
                   <button
                     type="button"
                     disabled={selected}
-                    onClick={() => setSelectedScenarioId(s.id)}
+                    onClick={() => {
+                      setSelectedChoiceId(null);
+                      setSelectedScenarioId(s.id);
+                    }}
                     className={`mt-2 rounded-lg border px-3 py-1.5 text-xs font-bold ${
                       selected
                         ? "border-[var(--accent)] text-[#4ade80]"
@@ -1263,6 +2095,9 @@ function BoardView({
         <div className="mt-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs leading-relaxed text-[var(--dim)]">
           <p>
             鉄道の路線図・時刻表は駅探と全国駅データ（HeartRails）から、バスの路線図・時刻表はGTFSデータリポジトリ（国土交通省）に収録された事業者のGTFSデータから取得しています（データ提供者の表記は各路線図・時刻表の出典に表示）。
+          </p>
+          <p className="mt-1">
+            鉄道については、駅探の列車別ページから列車ごとの種別（普通・快速・特急など）と各駅の到着・発車時刻も取得し、降車駅への実際の到着時刻と、途中の駅で速い電車へ乗り換える選択肢の判定に使っています。バス（GTFS）区間と登録済み時刻表の区間には列車単位のデータがないため、乗り換え判定の対象外です。
           </p>
           <p className="mt-1">
             京都市バスなど一部の事業者のGTFSデータは公共交通オープンデータセンター（ODPT）でのみ公開されており、利用には無料のアクセストークン（開発者登録）が必要です。このアプリにはトークンが設定されていないため、それらの事業者は路線図・時刻表の自動取得の対象外です。

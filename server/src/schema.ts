@@ -139,6 +139,43 @@ export const gtfsDepartures = sqliteTable("gtfs_departures", {
   holiday: text("holiday"),
 });
 
+// Per-train timetables from ekitan (駅探): the direction page of a
+// station lists every departure WITH its train type (普通/快速/特急…)
+// and destination, which the minutes-only timetable_cache cannot
+// express. One row per line + boarding station + toward; weekday /
+// holiday JSON arrays of {depart, type, dest, href}. The href points
+// at the train's own page, whose stop list (per-station arrival /
+// departure times and the stop pattern) is cached per train in
+// train_detail_cache. Together they let the board reason about
+// individual trains: real arrival times at the alighting station and
+// mid-segment transfers from a local onto a faster train.
+export const trainTimetableCache = sqliteTable("train_timetable_cache", {
+  // "<line>|<station core>|<toward core>"
+  cacheKey: text("cache_key").primaryKey(),
+  line: text("line").notNull(),
+  station: text("station").notNull(),
+  toward: text("toward").notNull(),
+  // JSON: [{depart, type, dest, href}]
+  weekdayTrains: text("weekday_trains"),
+  holidayTrains: text("holiday_trains"),
+  sourceUrl: text("source_url"),
+  sourceTitle: text("source_title"),
+  fetchedAt: integer("fetched_at", { mode: "timestamp_ms" }),
+});
+
+export const trainDetailCache = sqliteTable("train_detail_cache", {
+  // ekitan train id (the tx= parameter of the train page URL), which
+  // identifies one scheduled train run of a line/direction.
+  trainKey: text("train_key").primaryKey(),
+  line: text("line").notNull(),
+  trainType: text("train_type").notNull().default(""),
+  dest: text("dest").notNull().default(""),
+  // JSON: [{station, arrive, depart}] in travel order, stopping
+  // stations only; times are minutes-of-day (arrive/depart nullable).
+  stops: text("stops"),
+  fetchedAt: integer("fetched_at", { mode: "timestamp_ms" }),
+});
+
 export const appSettings = sqliteTable("app_settings", {
   id: integer("id").primaryKey(),
   activeRouteId: integer("active_route_id"),

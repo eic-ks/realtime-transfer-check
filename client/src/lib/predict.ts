@@ -29,6 +29,11 @@ export interface SegmentLike {
   returnHoliday: number[];
   learnedWalkMin: number | null;
   walkSamples: number;
+  /** Per-train data (rail segments with an ekitan source only). */
+  trainsWeekday?: RideTrain[];
+  trainsHoliday?: RideTrain[];
+  /** Mid-segment transfer options for this segment's trains. */
+  transferOptions?: TransferOption[];
 }
 
 export interface RouteLike {
@@ -44,6 +49,49 @@ export interface TimetableLike {
   toward: string;
   weekday: number[];
   holiday: number[];
+}
+
+/** One scheduled train of a ride segment, from the per-train
+ * timetable (ekitan). arriveDest is the train's own arrival minute
+ * at the segment's alighting station from its stop list, or null
+ * when the detail was not fetched / the train does not stop there. */
+export interface RideTrain {
+  depart: number;
+  type: string;
+  dest: string;
+  arriveDest: number | null;
+  /** False when the train's stop list is known NOT to include the
+   * alighting station (short workings, different branch); null when
+   * the stop list has not been fetched. */
+  servesDest?: boolean | null;
+}
+
+/** One stop of one train: station core + arrival/departure minutes. */
+export interface TrainStopLike {
+  station: string;
+  arrive: number | null;
+  depart: number | null;
+}
+
+/**
+ * A mid-segment transfer: ride the boarded train to an intermediate
+ * station, change onto a faster train of the same line/direction,
+ * and reach the alighting station at arriveDest. All minutes-of-day.
+ */
+export interface TransferOption {
+  /** Departure of the train boarded at the segment's start. */
+  boardDepart: number;
+  /** Type of the boarded train (e.g. 普通). */
+  boardType: string;
+  viaStation: string;
+  /** Arrival of the boarded train at the transfer station. */
+  localArriveVia: number;
+  /** Departure of the faster train at the transfer station. */
+  expressDepart: number;
+  expressType: string;
+  expressDest: string;
+  /** Arrival of the faster train at the alighting station. */
+  arriveDest: number;
 }
 
 /** Station name without the generic 駅 suffix, as used in cache keys. */
@@ -90,6 +138,101 @@ export function applyTimetables(
   return changed ? { ...route, segments } : route;
 }
 
+export interface TrainTimetableLike {
+  line: string;
+  station: string;
+  toward: string;
+  weekday: { depart: number; type: string; dest: string }[];
+  holiday: { depart: number; type: string; dest: string }[];
+}
+
+/** Loose station-core equality (梅田 vs 大阪梅田), mirroring the
+ * server's stationCoreLooseEq. */
+export function stationCoreLooseEq(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+  return (
+    (short as string).length >= 2 && (long as string).endsWith(short as string)
+  );
+}
+
+/** Detail-map key for one train's stop list. */
+export function trainDetailKey(
+  line: string,
+  station: string,
+  toward: string,
+  dayType: DayType,
+  depart: number,
+): string {
+  return `${timetableKey(line, station, toward)}|${dayType}|${depart}`;
+}
+
+/**
+ * Merge per-train data into a route: ride segments whose line +
+ * boarding station + direction have a fetched per-train timetable
+ * gain train lists (type / destination per departure), with real
+ * arrival minutes at the alighting station filled in from the
+ * fetched train details. Departure minutes come from the same
+ * trains, so the minutes model and the train model never diverge.
+ */
+export function applyTrainData(
+  route: RouteLike,
+  trainTimetables: TrainTimetableLike[],
+  details: Map<string, TrainStopLike[]>,
+): RouteLike {
+  if (trainTimetables.length === 0) return route;
+  const byKey = new Map(
+    trainTimetables.map((t) => [
+      timetableKey(t.line, t.station, t.toward),
+      t,
+    ]),
+  );
+  let changed = false;
+  const segments = route.segments.map((seg) => {
+    if (seg.type !== "ride" || !seg.line) return seg;
+    const station = seg.station ?? seg.fromLabel;
+    const tt = byKey.get(timetableKey(seg.line, station, seg.toLabel));
+    if (!tt || tt.weekday.length === 0) return seg;
+    const destCore = stationCore(seg.toLabel);
+    const build = (
+      list: { depart: number; type: string; dest: string }[],
+      dayType: DayType,
+    ): RideTrain[] =>
+      list.map((t) => {
+        const stops = details.get(
+          trainDetailKey(seg.line as string, station, seg.toLabel, dayType, t.depart),
+        );
+        if (!stops) {
+          return { ...t, arriveDest: null, servesDest: null };
+        }
+        const stop = stops.find((s) =>
+          stationCoreLooseEq(stationCore(s.station), destCore),
+        );
+        if (!stop) return { ...t, arriveDest: null, servesDest: false };
+        return {
+          ...t,
+          arriveDest: stop.arrive ?? stop.depart,
+          servesDest: true,
+        };
+      });
+    changed = true;
+    return {
+      ...seg,
+      departuresWeekday: tt.weekday.map((t) => t.depart),
+      departuresHoliday: (tt.holiday.length > 0 ? tt.holiday : tt.weekday).map(
+        (t) => t.depart,
+      ),
+      trainsWeekday: build(tt.weekday, "weekday"),
+      trainsHoliday: build(
+        tt.holiday.length > 0 ? tt.holiday : tt.weekday,
+        "holiday",
+      ),
+    };
+  });
+  return changed ? { ...route, segments } : route;
+}
+
 export interface StatusLike {
   line: string;
   status: "normal" | "delayed" | "suspended" | "unknown";
@@ -131,6 +274,21 @@ export interface LegPlan {
   /** Transfer wait before this ride: depart − previous ride's arrival
    * − this segment's access minutes. Null for walks and the first ride. */
   waitMin: number | null;
+  /** Train type of the ridden train (特急/快速/普通…), when per-train
+   * data is available for this segment. */
+  trainType: string | null;
+  /** Destination of the ridden train, when known. */
+  trainDest: string | null;
+  /** Mid-segment transfer actually used: alight at viaStation from
+   * the boarded train and continue on a faster train. Times are
+   * effective (delay applied) absolute minutes. */
+  transferWithin: {
+    viaStation: string;
+    localArriveVia: number;
+    expressDepart: number;
+    expressType: string;
+    expressDest: string;
+  } | null;
 }
 
 export interface PlanOption {
@@ -166,12 +324,40 @@ function departuresFor(seg: SegmentLike, dayType: DayType): number[] {
   return [...list].sort((a, b) => a - b);
 }
 
+/** How the first ride's mid-segment transfer choice is resolved:
+ * "auto" = fastest arrival (use a transfer when it arrives earlier),
+ * "stay" = ride the boarded train through, "transfer" = use the best
+ * mid-segment transfer of the boarded train. */
+export type FirstRideMode = "auto" | "stay" | "transfer";
+
+export interface PlanConstraint {
+  /** Minutes-of-day departure the first ride must board. */
+  firstDepart?: number;
+  firstMode?: FirstRideMode;
+}
+
+function trainsFor(seg: SegmentLike, dayType: DayType): RideTrain[] {
+  const list =
+    dayType === "weekday" ? seg.trainsWeekday : seg.trainsHoliday;
+  return [...(list ?? [])].sort((a, b) => a.depart - b.depart);
+}
+
+interface RidePick {
+  /** Scheduled departure, absolute minutes (may exceed 1440). */
+  schedAbs: number;
+  /** Scheduled arrival at the alighting station, absolute minutes. */
+  arriveSchedAbs: number;
+  train: RideTrain | null;
+  transfer: TransferOption | null;
+}
+
 export function computePlans(
   route: RouteLike,
   dayType: DayType,
   statuses: Map<string, StatusLike>,
   nowMin: number,
   startIndex: number,
+  constraint?: PlanConstraint,
 ): PlanResult {
   const segs = route.segments;
   const empty: PlanResult = {
@@ -225,11 +411,135 @@ export function computePlans(
     delayMin: 0,
     suspended: false,
     waitMin: null,
+    trainType: null,
+    trainDest: null,
+    transferWithin: null,
   });
+
+  /** Best arrival (minutes-of-day) at the alighting station for one
+   * train of a segment, optionally via its mid-segment transfers. */
+  const bestForTrain = (
+    seg: SegmentLike,
+    train: RideTrain,
+    mode: FirstRideMode,
+  ): { arrive: number; transfer: TransferOption | null } => {
+    const direct = train.arriveDest ?? train.depart + (seg.rideMin ?? 0);
+    if (mode === "stay") return { arrive: direct, transfer: null };
+    const options = (seg.transferOptions ?? []).filter(
+      (o) => o.boardDepart === train.depart,
+    );
+    if (options.length === 0) return { arrive: direct, transfer: null };
+    let bestOpt: TransferOption | null = null;
+    for (const o of options) {
+      if (!bestOpt || o.arriveDest < bestOpt.arriveDest) bestOpt = o;
+    }
+    if (mode === "transfer") {
+      return bestOpt
+        ? { arrive: bestOpt.arriveDest, transfer: bestOpt }
+        : { arrive: direct, transfer: null };
+    }
+    // auto: a transfer only counts when it actually arrives earlier.
+    return bestOpt && bestOpt.arriveDest < direct
+      ? { arrive: bestOpt.arriveDest, transfer: bestOpt }
+      : { arrive: direct, transfer: null };
+  };
+
+  /**
+   * Pick which train to ride on one segment. With per-train data the
+   * pick minimizes the ARRIVAL at the alighting station (a later
+   * express can beat an earlier local; a mid-segment transfer counts
+   * in "auto"/"transfer" modes). Without per-train data this is the
+   * earliest catchable departure, as before.
+   */
+  const pickRide = (
+    seg: SegmentLike,
+    earliest: number,
+    delay: number,
+    fixed?: { departMod: number; mode: FirstRideMode; dayOffset: number },
+  ): RidePick | null => {
+    const trains = trainsFor(seg, dayType).filter(
+      (t) => t.servesDest !== false,
+    );
+    if (trains.length === 0) {
+      // Minutes-only model.
+      const segDeps = departuresFor(seg, dayType);
+      let schedAbs: number | null = null;
+      if (fixed) {
+        schedAbs = fixed.departMod + fixed.dayOffset;
+      } else {
+        for (const d of segDeps) {
+          if (d + delay >= earliest) {
+            schedAbs = d;
+            break;
+          }
+        }
+        if (schedAbs == null) {
+          const firstDep = segDeps[0];
+          if (firstDep != null) schedAbs = firstDep + 1440;
+        }
+      }
+      if (schedAbs == null) return null;
+      return {
+        schedAbs,
+        arriveSchedAbs: schedAbs + (seg.rideMin ?? 0),
+        train: null,
+        transfer: null,
+      };
+    }
+    if (fixed) {
+      const train =
+        trains.find((t) => t.depart === fixed.departMod) ??
+        trainsFor(seg, dayType).find((t) => t.depart === fixed.departMod);
+      if (!train) return null;
+      const best = bestForTrain(seg, train, fixed.mode);
+      return {
+        schedAbs: train.depart + fixed.dayOffset,
+        arriveSchedAbs: best.arrive + fixed.dayOffset,
+        train,
+        transfer: best.transfer,
+      };
+    }
+    let best: RidePick | null = null;
+    for (const train of trains) {
+      if (train.depart + delay < earliest) continue;
+      if (best && train.depart > earliest + 180) break;
+      const b = bestForTrain(seg, train, "auto");
+      const cand: RidePick = {
+        schedAbs: train.depart,
+        arriveSchedAbs: b.arrive,
+        train,
+        transfer: b.transfer,
+      };
+      if (
+        !best ||
+        cand.arriveSchedAbs < best.arriveSchedAbs ||
+        (cand.arriveSchedAbs === best.arriveSchedAbs &&
+          cand.schedAbs < best.schedAbs)
+      ) {
+        best = cand;
+      }
+      // Once a train departing at/after the best arrival is reached,
+      // nothing later can arrive earlier on the same segment.
+      if (best && train.depart >= best.arriveSchedAbs) break;
+    }
+    if (best) return best;
+    const firstTrain = trains[0];
+    if (!firstTrain) return null;
+    const b = bestForTrain(seg, firstTrain, "auto");
+    return {
+      schedAbs: firstTrain.depart + 1440,
+      arriveSchedAbs: b.arrive + 1440,
+      train: firstTrain,
+      transfer: b.transfer,
+    };
+  };
 
   /** Build a full itinerary whose first ride departs at firstSchedAbs
    * (absolute scheduled minutes; >=1440 means tomorrow). */
-  const buildChain = (firstSchedAbs: number): PlanOption | null => {
+  const buildChain = (
+    firstSchedAbs: number,
+    firstMode: FirstRideMode = "auto",
+  ): PlanOption | null => {
     const legs: LegPlan[] = [];
     let cur = nowMin;
     for (let i = startIndex; i < firstRideIdx; i++) {
@@ -254,33 +564,25 @@ export function computePlans(
       if (seg.type !== "ride") continue;
       const segStatus = seg.line ? statuses.get(seg.line) : undefined;
       const segDelay = effectiveDelayMin(segStatus);
-      const segDeps = departuresFor(seg, dayType);
-      let schedAbs: number | null = null;
-      if (rideCount === 0) {
-        schedAbs = firstSchedAbs;
-      } else {
-        const earliest = cur + (seg.accessMin ?? 0);
-        // Earliest catchable departure TODAY; only when none remains
-        // does the chain continue on tomorrow's first departure.
-        // (Checking [today, tomorrow] per departure and taking the
-        // first hit is wrong: for an early-morning departure that has
-        // already left, its tomorrow instance always "matches", so
-        // the chain jumps to tomorrow even in the middle of the day —
-        // this once produced a 505-minute "wait" at なんば at 20:52.)
-        for (const d of segDeps) {
-          if (d + segDelay >= earliest) {
-            schedAbs = d;
-            break;
-          }
-        }
-        if (schedAbs == null) {
-          const firstDep = segDeps[0];
-          if (firstDep != null) schedAbs = firstDep + 1440;
-        }
-      }
-      if (schedAbs == null) return null;
+      // Earliest catchable departure TODAY; only when none remains
+      // does the chain continue on tomorrow's first departure.
+      // (Checking [today, tomorrow] per departure and taking the
+      // first hit is wrong: for an early-morning departure that has
+      // already left, its tomorrow instance always "matches", so
+      // the chain jumps to tomorrow even in the middle of the day —
+      // this once produced a 505-minute "wait" at なんば at 20:52.)
+      const pick =
+        rideCount === 0
+          ? pickRide(seg, Number.NEGATIVE_INFINITY, segDelay, {
+              departMod: ((firstSchedAbs % 1440) + 1440) % 1440,
+              mode: firstMode,
+              dayOffset: firstSchedAbs >= 1440 ? 1440 : 0,
+            })
+          : pickRide(seg, cur + (seg.accessMin ?? 0), segDelay, undefined);
+      if (!pick) return null;
+      const schedAbs = pick.schedAbs;
       const departAbs = schedAbs + segDelay;
-      const arrive = departAbs + (seg.rideMin ?? 0);
+      const arrive = pick.arriveSchedAbs + segDelay;
       const waitMin =
         rideCount > 0 && prevRideArrive != null
           ? Math.max(
@@ -294,6 +596,7 @@ export function computePlans(
         boardAtSched = schedAbs;
       }
       rideCount += 1;
+      const dayOffset = schedAbs >= 1440 ? 1440 : 0;
       legs.push({
         segmentId: seg.id,
         kind: "ride",
@@ -309,6 +612,17 @@ export function computePlans(
         delayMin: segDelay,
         suspended: isSuspended(segStatus),
         waitMin,
+        trainType: pick.train?.type ?? null,
+        trainDest: pick.train?.dest ?? null,
+        transferWithin: pick.transfer
+          ? {
+              viaStation: pick.transfer.viaStation,
+              localArriveVia: pick.transfer.localArriveVia + dayOffset + segDelay,
+              expressDepart: pick.transfer.expressDepart + dayOffset + segDelay,
+              expressType: pick.transfer.expressType,
+              expressDest: pick.transfer.expressDest,
+            }
+          : null,
       });
       prevRideArrive = arrive;
       cur = arrive;
@@ -335,7 +649,25 @@ export function computePlans(
   };
   if (firstSuspended) return base;
 
-  const candidates = deps.filter((d) => d + firstDelay >= need).slice(0, 3);
+  // A fixed first-train choice (the focus tabs): board exactly this
+  // departure, with the requested mid-segment transfer behaviour.
+  if (constraint?.firstDepart != null) {
+    const dep = constraint.firstDepart;
+    const abs = dep + firstDelay >= need ? dep : dep + 1440;
+    const opt = buildChain(abs, constraint.firstMode ?? "auto");
+    return { ...base, options: opt ? [opt] : [], endOfService: abs >= 1440 };
+  }
+
+  const firstTrains = trainsFor(firstRide, dayType).filter(
+    (t) => t.servesDest !== false,
+  );
+  const candidates =
+    firstTrains.length > 0
+      ? firstTrains
+          .map((t) => t.depart)
+          .filter((d) => d + firstDelay >= need)
+          .slice(0, 3)
+      : deps.filter((d) => d + firstDelay >= need).slice(0, 3);
   const options: PlanOption[] = [];
   for (const c of candidates) {
     const opt = buildChain(c);
@@ -343,12 +675,129 @@ export function computePlans(
   }
   if (options.length > 0) return { ...base, options };
 
-  const first = deps[0];
+  const first = firstTrains.length > 0 ? firstTrains[0]?.depart : deps[0];
   if (first != null) {
     const opt = buildChain(first + 1440);
     return { ...base, options: opt ? [opt] : [], endOfService: true };
   }
   return { ...base, endOfService: true };
+}
+
+export interface FocusChoice {
+  id: string;
+  /** Departure (minutes-of-day) boarded at the first ride segment. */
+  boardDepart: number;
+  /** How many trains later than the first catchable one (0 = first). */
+  laterBy: number;
+  /** Train type of the boarded train, when per-train data exists. */
+  boardType: string | null;
+  boardDest: string | null;
+  /** The mid-segment transfer behaviour of this choice. */
+  mode: "stay" | "transfer" | "direct";
+  /** Transfer station when mode === "transfer". */
+  viaStation: string | null;
+  expressType: string | null;
+  plan: PlanOption;
+}
+
+/**
+ * The choices the user actually faces at the first boarding point,
+ * per the requested interaction: focus on the trains connectable
+ * from this moment; at a mid-segment transfer opportunity choose
+ * 乗り換える (change onto the faster train) or 乗り換えない (stay
+ * through, keep the seat); departing one train later gets the same
+ * treatment. Every choice is a full re-simulation to the final
+ * arrival, so how the downstream catchable trains change is visible
+ * in each choice's plan legs.
+ */
+export function computeFocusChoices(
+  route: RouteLike,
+  dayType: DayType,
+  statuses: Map<string, StatusLike>,
+  nowMin: number,
+  startIndex: number,
+): FocusChoice[] {
+  const segs = route.segments;
+  const firstRideIdx = segs.findIndex(
+    (s, i) => i >= startIndex && s.type === "ride",
+  );
+  const firstRide = firstRideIdx >= 0 ? segs[firstRideIdx] : undefined;
+  if (!firstRide) return [];
+  const firstStatus = firstRide.line
+    ? statuses.get(firstRide.line)
+    : undefined;
+  if (isSuspended(firstStatus)) return [];
+  const firstDelay = effectiveDelayMin(firstStatus);
+  let toPlatform = 0;
+  for (let i = startIndex; i < firstRideIdx; i++) {
+    const seg = segs[i];
+    if (seg && seg.type === "walk") toPlatform += walkMinutes(seg) ?? 0;
+  }
+  toPlatform += firstRide.accessMin ?? 0;
+  const need = nowMin + toPlatform + route.bufferMin;
+
+  const trains = trainsFor(firstRide, dayType).filter(
+    (t) => t.servesDest !== false,
+  );
+  const boardList: { depart: number; type: string | null; dest: string | null }[] =
+    trains.length > 0
+      ? trains
+          .filter((t) => t.depart + firstDelay >= need)
+          .slice(0, 3)
+          .map((t) => ({ depart: t.depart, type: t.type, dest: t.dest }))
+      : departuresFor(firstRide, dayType)
+          .filter((d) => d + firstDelay >= need)
+          .slice(0, 3)
+          .map((d) => ({ depart: d, type: null, dest: null }));
+
+  const out: FocusChoice[] = [];
+  boardList.forEach((b, idx) => {
+    const options = (firstRide.transferOptions ?? []).filter(
+      (o) => o.boardDepart === b.depart,
+    );
+    const directArrive =
+      trains.find((t) => t.depart === b.depart)?.arriveDest ??
+      b.depart + (firstRide.rideMin ?? 0);
+    const useful = options.filter((o) => o.arriveDest < directArrive);
+    const variants: {
+      mode: "stay" | "transfer" | "direct";
+      viaStation: string | null;
+      expressType: string | null;
+    }[] =
+      useful.length > 0
+        ? [
+            {
+              mode: "transfer",
+              viaStation: useful.reduce((a, c) =>
+                c.arriveDest < a.arriveDest ? c : a,
+              ).viaStation,
+              expressType: useful.reduce((a, c) =>
+                c.arriveDest < a.arriveDest ? c : a,
+              ).expressType,
+            },
+            { mode: "stay", viaStation: null, expressType: null },
+          ]
+        : [{ mode: "direct", viaStation: null, expressType: null }];
+    for (const v of variants) {
+      const plan = computePlans(route, dayType, statuses, nowMin, startIndex, {
+        firstDepart: b.depart,
+        firstMode: v.mode === "direct" ? "stay" : v.mode,
+      }).options[0];
+      if (!plan) continue;
+      out.push({
+        id: `focus-${b.depart}-${v.mode}`,
+        boardDepart: b.depart,
+        laterBy: idx,
+        boardType: b.type,
+        boardDest: b.dest,
+        mode: v.mode,
+        viaStation: v.viaStation,
+        expressType: v.expressType,
+        plan,
+      });
+    }
+  });
+  return out;
 }
 
 export interface Scenario {
@@ -412,9 +861,32 @@ export function computeScenarios(
       ...route,
       segments: route.segments.map((s) => {
         if (s.id !== seg.id) return s;
-        return dayType === "weekday"
-          ? { ...s, departuresWeekday: s.departuresWeekday.filter((d) => d !== depMin) }
-          : { ...s, departuresHoliday: s.departuresHoliday.filter((d) => d !== depMin) };
+        const base =
+          dayType === "weekday"
+            ? {
+                ...s,
+                departuresWeekday: s.departuresWeekday.filter(
+                  (d) => d !== depMin,
+                ),
+                trainsWeekday: (s.trainsWeekday ?? []).filter(
+                  (t) => t.depart !== depMin,
+                ),
+              }
+            : {
+                ...s,
+                departuresHoliday: s.departuresHoliday.filter(
+                  (d) => d !== depMin,
+                ),
+                trainsHoliday: (s.trainsHoliday ?? []).filter(
+                  (t) => t.depart !== depMin,
+                ),
+              };
+        return {
+          ...base,
+          transferOptions: (s.transferOptions ?? []).filter(
+            (o) => o.boardDepart !== depMin,
+          ),
+        };
       }),
     };
     const variant = computePlans(variantRoute, dayType, statuses, nowMin, startIndex)
@@ -613,6 +1085,11 @@ export function reversedRoute(route: RouteLike): RouteLike {
     } else if (seg.type === "ride") {
       out.push({
         ...seg,
+        // Per-train data is direction-specific: the return view
+        // fetches its own trains for the reversed station pair.
+        trainsWeekday: undefined,
+        trainsHoliday: undefined,
+        transferOptions: undefined,
         fromLabel: seg.toLabel,
         toLabel: seg.station ?? seg.fromLabel,
         station: seg.toLabel,

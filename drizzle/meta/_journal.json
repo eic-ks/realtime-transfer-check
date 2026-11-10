@@ -36,6 +36,13 @@
       "when": 1794306457694,
       "tag": "0005_add_gtfs_bus_tables",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1794311211963,
+      "tag": "0006_add_train_timetable_tables",
+      "breakpoints": true
     }
   ]
 }

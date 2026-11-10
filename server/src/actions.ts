@@ -1096,6 +1096,172 @@ function parseEkitanTimes(html: string, dirNum?: number): number[] {
   return [...out].sort((a, b) => a - b);
 }
 
+// ---------- per-train data (type / destination / stop pattern) ----------
+//
+// The minutes-only parse above cannot express WHICH train departs:
+// ekitan's direction page marks every departure with its train type
+// and destination —
+//   <li class="ek-narrow" data-tr-type="準特急" data-dest="大阪梅田">
+//     <a href="/timetable/railway/train?sf=…&tx=…&departure=0605&…">
+//       <span class="dep-time">06:05</span>
+//       <span class="train-type …">準特急</span>
+//       <span class="destination">大阪梅田行き</span>
+// — and each train page lists its stopping stations as table rows
+//   <td class="td-dep-and-arr-time"><span>06:09着</span><span>06:09発</span></td>
+//   <td class="td-station-name"><a …>岡本(兵庫)</a></td>
+// (the 着/発 suffix is authoritative; the span class names are not).
+// Verified live 2026-11-10 on 阪急神戸本線 六甲 (普通/準特急/快速/急行),
+// 京阪本線 出町柳 (特急/快速急行/急行/準急/普通…) and 大阪メトロ御堂筋線
+// なんば (all 普通, real per-station times at 梅田). Both parsers are
+// deterministic; nothing is inferred or fabricated, and a page that
+// does not carry the markup yields an empty list so callers fall
+// back to the minutes-only model.
+
+interface TrainDeparture {
+  depart: number;
+  type: string;
+  dest: string;
+  href: string;
+}
+
+interface TrainStopTime {
+  station: string;
+  arrive: number | null;
+  depart: number | null;
+}
+
+const TRAIN_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Station name as used in train stop lists: core name with the
+ * operator suffix in parentheses removed (岡本(兵庫) → 岡本,
+ * 大阪梅田(阪急) → 大阪梅田, なんば(大阪メトロ) → なんば). */
+function trainStopCore(name: string): string {
+  return coreName(name.replace(/\(.*?\)|（.*?）/gu, "").trim());
+}
+
+/** Per-train departures of one direction block of an ekitan page. */
+function parseEkitanTrains(html: string, dirNum?: number): TrainDeparture[] {
+  const slice = ekitanDirectionSlice(html, dirNum);
+  const out: TrainDeparture[] = [];
+  const seen = new Set<string>();
+  const liRe =
+    /data-tr-type="([^"]*)"\s+data-dest="([^"]*)"[^>]*>\s*<a href="(\/timetable\/railway\/train\?[^"]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = liRe.exec(slice)) !== null) {
+    const type = (m[1] ?? "").trim();
+    const dest = (m[2] ?? "").trim();
+    const href = (m[3] ?? "").replace(/&amp;/g, "&");
+    if (!href) continue;
+    // Departure minutes: the href's departure=HHMM parameter is the
+    // machine-readable form; fall back to the dep-time span nearby.
+    let depart: number | null = null;
+    const depParam = /[?&]departure=(\d{2})(\d{2})/.exec(href);
+    if (depParam) {
+      depart = Number(depParam[1]) * 60 + Number(depParam[2]);
+    } else {
+      const span = /dep-time"[^>]*>(\d{1,2}):(\d{2})/.exec(
+        slice.slice(m.index, m.index + 600),
+      );
+      if (span) depart = Number(span[1]) * 60 + Number(span[2]);
+    }
+    if (depart == null || depart < 0 || depart >= 1560) continue;
+    const key = `${depart}|${href}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ depart, type, dest, href });
+  }
+  return out.sort((a, b) => a.depart - b.depart);
+}
+
+/** Stable per-train cache key: ekitan's tx= train id when present. */
+function trainKeyOfHref(href: string): string {
+  const tx = /[?&]tx=([^&]+)/.exec(href)?.[1];
+  if (tx) return tx;
+  return href.replace(/([?&])dt=\d+/, "$1").replace(/[?&]dw=[^&]*/, "");
+}
+
+/** Stop list of one train page: stopping stations in travel order. */
+function parseEkitanTrainStops(html: string): TrainStopTime[] {
+  const out: TrainStopTime[] = [];
+  const rowRe =
+    /<td class="td-dep-and-arr-time">([\s\S]*?)<\/td>\s*<td class="td-station-name"><a[^>]*>([^<]+)<\/a>/g;
+  let m: RegExpExecArray | null;
+  while ((m = rowRe.exec(html)) !== null) {
+    const station = trainStopCore(m[2] ?? "");
+    if (!station) continue;
+    let arrive: number | null = null;
+    let depart: number | null = null;
+    const timeRe = /(\d{1,2}):(\d{2})(発|着)/g;
+    let tm: RegExpExecArray | null;
+    while ((tm = timeRe.exec(m[1] ?? "")) !== null) {
+      const t = Number(tm[1]) * 60 + Number(tm[2]);
+      if (tm[3] === "着") arrive = t;
+      else depart = t;
+    }
+    if (arrive == null && depart == null) continue;
+    out.push({ station, arrive, depart });
+  }
+  return out;
+}
+
+/** Train type + destination from a train page's title block
+ * ("阪急神戸本線 始発：新開地 準特急 大阪梅田(阪急)行き"). */
+function parseEkitanTrainTitle(html: string): {
+  type: string;
+  dest: string;
+} {
+  const inner =
+    /ek-onetrain-title-inner">([\s\S]*?)<\/span>/.exec(html)?.[1] ?? "";
+  const text = htmlToText(inner);
+  const m = /始発：\S+\s+(.+?)\s+(\S+?)行き/u.exec(text);
+  if (!m) return { type: "", dest: "" };
+  return {
+    type: (m[1] ?? "").trim(),
+    dest: trainStopCore(m[2] ?? ""),
+  };
+}
+
+function parseTrainListJson(raw: string | null): TrainDeparture[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (t): t is TrainDeparture =>
+          typeof t === "object" &&
+          t != null &&
+          typeof (t as TrainDeparture).depart === "number" &&
+          typeof (t as TrainDeparture).href === "string",
+      )
+      .map((t) => ({
+        depart: t.depart,
+        type: typeof t.type === "string" ? t.type : "",
+        dest: typeof t.dest === "string" ? t.dest : "",
+        href: t.href,
+      }))
+      .sort((a, b) => a.depart - b.depart);
+  } catch {
+    return [];
+  }
+}
+
+function parseTrainStopsJson(raw: string | null): TrainStopTime[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (s): s is TrainStopTime =>
+        typeof s === "object" &&
+        s != null &&
+        typeof (s as TrainStopTime).station === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
 /** YYYYMMDD of the next JST date (1–7 days ahead) with weekday dow
  * (0=Sunday … 6=Saturday). A Tuesday renders ekitan's weekday
  * timetable; a Saturday its holiday one. */
@@ -1729,6 +1895,397 @@ function parseGtfsStopsJson(raw: string | null): GtfsStop[] {
 }
 
 // ---------- actions ----------
+
+// ---------- shared ekitan direction resolution + per-train fetch ----------
+
+type EkitanSearchFn = (query: string) => Promise<{
+  content: {
+    results?: Array<{
+      url?: string | null;
+      title?: string | null;
+      source?: string | null;
+    }>;
+  };
+}>;
+
+/**
+ * Resolve the ekitan direction links for (line, boarding station) —
+ * the same deterministic resolution fetchTimetable uses (regional
+ * index → line page → station page), with the web-search backup
+ * paths. Extracted so the per-train fetch shares exactly one
+ * resolution implementation.
+ */
+async function resolveEkitanDirectionsShared(
+  search: EkitanSearchFn,
+  line: string,
+  station: string,
+): Promise<EkitanDirection[] | { error: string }> {
+  const stationCore = coreName(station);
+  const stationCores = stationNameVariants(station);
+  const fromStationPage = async (
+    stationUrl: string,
+  ): Promise<EkitanDirection[] | null> => {
+    const html = await fetchPageText(stationUrl);
+    if (!html) return null;
+    const title = /<title>([^<]+)<\/title>/.exec(html)?.[1] ?? "";
+    const titleOk = stationCores.some((c) => {
+      if (title.includes(c)) return true;
+      const short = c.replace(/^(?:大阪|東京|京都|神戸|名古屋)/u, "");
+      return short.length >= 2 && title.includes(short);
+    });
+    if (!titleOk) return null;
+    const blocks = parseEkitanStationPage(html);
+    const block = blocks.find((b) => lineNameMatch(line, b.line));
+    return block ? block.directions : null;
+  };
+  const fromLinePage = async (
+    lineUrl: string,
+  ): Promise<EkitanDirection[] | null> => {
+    const html = await fetchPageText(lineUrl);
+    if (!html) return null;
+    const anchorRe =
+      /href="(\/timetable\/railway\/station\/\d+)"[^>]*>([^<]+)<\/a>/g;
+    let am: RegExpExecArray | null;
+    while ((am = anchorRe.exec(html)) !== null) {
+      const href = am[1];
+      const name = (am[2] ?? "").replace(/\(.*?\)|（.*?）/gu, "");
+      if (
+        href &&
+        stationCores.some((v) => stationCoreLooseEq(coreName(name), v))
+      ) {
+        return fromStationPage(EKITAN_BASE + href);
+      }
+    }
+    return null;
+  };
+
+  const PREFECTURE_AREA: Record<string, number> = {
+    "北海道": 3,
+    "青森県": 4, "岩手県": 4, "宮城県": 4, "秋田県": 4, "山形県": 4, "福島県": 4,
+    "茨城県": 0, "栃木県": 0, "群馬県": 0, "埼玉県": 0, "千葉県": 0, "東京都": 0, "神奈川県": 0,
+    "新潟県": 6, "山梨県": 6, "長野県": 6,
+    "富山県": 5, "石川県": 5, "福井県": 5,
+    "岐阜県": 2, "静岡県": 2, "愛知県": 2, "三重県": 2,
+    "滋賀県": 1, "京都府": 1, "大阪府": 1, "兵庫県": 1, "奈良県": 1, "和歌山県": 1,
+    "鳥取県": 7, "島根県": 7, "岡山県": 7, "広島県": 7, "山口県": 7,
+    "徳島県": 8, "香川県": 8, "愛媛県": 8, "高知県": 8,
+    "福岡県": 9, "佐賀県": 9, "長崎県": 9, "熊本県": 9, "大分県": 9, "宮崎県": 9, "鹿児島県": 9, "沖縄県": 9,
+  };
+  let prefArea: number | null = null;
+  try {
+    const stations = await heartRailsLineStations(line);
+    const boarding = stations.find((s) =>
+      stationCores.some((v) => stationCoreLooseEq(coreName(s.name), v)),
+    );
+    if (boarding) {
+      prefArea = PREFECTURE_AREA[boarding.prefecture] ?? null;
+    }
+  } catch {
+    // region unknown -> scan all regions in order
+  }
+  const areaOrder = [
+    ...(prefArea != null ? [prefArea] : []),
+    ...[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].filter((a) => a !== prefArea),
+  ];
+  for (const area of areaOrder) {
+    const html = await fetchPageText(
+      `${EKITAN_BASE}/timetable/railway/area/${area}`,
+    );
+    if (!html) continue;
+    const lineRe =
+      /<a href="(\/timetable\/railway\/line\/\d+)"[^>]*>(?:<span[^>]*>)?([^<]+)/g;
+    const matches: { url: string; exact: boolean }[] = [];
+    let lm: RegExpExecArray | null;
+    while ((lm = lineRe.exec(html)) !== null) {
+      const href = lm[1];
+      const name = (lm[2] ?? "").trim();
+      if (!href || !name) continue;
+      if (lineNameMatch(line, name)) {
+        matches.push({
+          url: EKITAN_BASE + href,
+          exact:
+            coreName(name).replace(/^JR/u, "") ===
+            coreName(line).replace(/^JR/u, ""),
+        });
+      }
+    }
+    matches.sort((a, b) => Number(b.exact) - Number(a.exact));
+    for (const cand of matches.slice(0, 2)) {
+      const dirs = await fromLinePage(cand.url);
+      if (dirs && dirs.length > 0) return dirs;
+    }
+    if (matches.length > 0) break;
+  }
+
+  const stationUrls: string[] = [];
+  const lineUrls: string[] = [];
+  const lineStationCodes: string[] = [];
+  const queries = [
+    `${line} ${stationCore}駅 時刻表 駅探`,
+    `${stationCore}駅 時刻表 駅探`,
+    `${line} ${stationCore}駅 時刻表`,
+  ];
+  for (const q of queries) {
+    try {
+      const res = await search(q);
+      for (const r of res.content.results ?? []) {
+        const u = r.url ?? "";
+        const sm = /ekitan\.com\/timetable\/railway\/station\/(\d+)/.exec(u);
+        if (sm?.[1]) {
+          const url = `${EKITAN_BASE}/timetable/railway/station/${sm[1]}`;
+          if (!stationUrls.includes(url)) stationUrls.push(url);
+          continue;
+        }
+        const sf = /[?&]sf=(\d+)/.exec(u);
+        if (sf?.[1] && u.includes("ekitan.com")) {
+          const url = `${EKITAN_BASE}/timetable/railway/station/${sf[1]}`;
+          if (!stationUrls.includes(url)) stationUrls.push(url);
+        }
+        const sff = /[?&]SFF=([0-9]+-[0-9]+)/.exec(u);
+        if (sff?.[1] && u.includes("ekitan.com")) {
+          if (!lineStationCodes.includes(sff[1])) {
+            lineStationCodes.push(sff[1]);
+          }
+        }
+        const lm2 = /ekitan\.com\/timetable\/railway\/line\/(\d+)/.exec(u);
+        if (lm2?.[1]) {
+          const url = `${EKITAN_BASE}/timetable/railway/line/${lm2[1]}`;
+          if (!lineUrls.includes(url)) lineUrls.push(url);
+        }
+      }
+    } catch {
+      // try the next query phrasing
+    }
+    if (stationUrls.length > 0) break;
+  }
+  for (const url of stationUrls.slice(0, 3)) {
+    const dirs = await fromStationPage(url);
+    if (dirs && dirs.length > 0) return dirs;
+  }
+  for (const url of lineUrls.slice(0, 2)) {
+    const dirs = await fromLinePage(url);
+    if (dirs && dirs.length > 0) return dirs;
+  }
+  for (const code of lineStationCodes.slice(0, 2)) {
+    const dirs: EkitanDirection[] = [];
+    for (const d of ["d1", "d2"]) {
+      const url = `${EKITAN_BASE}/timetable/railway/line-station/${code}/${d}`;
+      const html = await fetchPageText(url);
+      if (!html) continue;
+      const title = /<title>([^<]+)<\/title>/.exec(html)?.[1] ?? "";
+      const titleOk = stationCores.some((c) => {
+        if (title.includes(c)) return true;
+        const short = c.replace(/^(?:大阪|東京|京都|神戸|名古屋)/u, "");
+        return short.length >= 2 && title.includes(short);
+      });
+      if (!titleOk) continue;
+      const label = /(\S+方面)の時刻表/u.exec(title)?.[1];
+      if (label) dirs.push({ url, label });
+    }
+    if (dirs.length > 0) return dirs;
+  }
+  return {
+    error: `駅探で「${stationCore}駅」の「${line}」時刻表を見つけられませんでした`,
+  };
+}
+
+interface TrainTimetableResult {
+  weekday: TrainDeparture[];
+  holiday: TrainDeparture[];
+  sourceUrl: string | null;
+  sourceTitle: string | null;
+}
+
+/**
+ * Per-train timetable for one ride segment (line + boarding station +
+ * direction toward the alighting station), cached in
+ * train_timetable_cache (7-day TTL). Rail only: the source is the
+ * ekitan direction page, whose every departure carries its train
+ * type, destination and a link to the train's own page. Also refreshes
+ * the minutes-only timetable_cache row from the same fetch so both
+ * models stay consistent.
+ */
+async function ensureTrainTimetable(
+  ctx: Ctx,
+  line: string,
+  station: string,
+  toward: string,
+): Promise<
+  | { ok: true; data: TrainTimetableResult }
+  | { ok: false; message: string }
+> {
+  const db = ctx.db<typeof schema>();
+  const stationCore = coreName(station);
+  const towardCore = coreName(toward);
+  const cacheKey = `${line}|${stationCore}|${towardCore}`;
+  const cached = (
+    await db
+      .select()
+      .from(schema.trainTimetableCache)
+      .where(eq(schema.trainTimetableCache.cacheKey, cacheKey))
+  )[0];
+  if (
+    cached &&
+    cached.fetchedAt &&
+    Date.now() - cached.fetchedAt.getTime() < TRAIN_CACHE_TTL_MS
+  ) {
+    const weekday = parseTrainListJson(cached.weekdayTrains);
+    if (weekday.length > 0) {
+      return {
+        ok: true,
+        data: {
+          weekday,
+          holiday: parseTrainListJson(cached.holidayTrains),
+          sourceUrl: cached.sourceUrl,
+          sourceTitle: cached.sourceTitle,
+        },
+      };
+    }
+  }
+
+  const resolved = await resolveEkitanDirectionsShared(
+    (q) => ctx.tool.web_search(q),
+    line,
+    station,
+  );
+  if ("error" in resolved) return { ok: false, message: resolved.error };
+  const dir = await pickEkitanDirection(
+    resolved,
+    line,
+    stationCore,
+    towardCore,
+  );
+  if (!dir) {
+    return { ok: false, message: "方面（方向）を特定できませんでした" };
+  }
+  const dirNumRaw = /\/d(\d)$/.exec(dir.url)?.[1];
+  const dirNum = dirNumRaw != null ? Number(dirNumRaw) : undefined;
+  const weekdayHtml = await fetchPageText(`${dir.url}?dt=${nextJstDate(2)}`);
+  const holidayHtml = await fetchPageText(`${dir.url}?dt=${nextJstDate(6)}`);
+  const weekday = weekdayHtml ? parseEkitanTrains(weekdayHtml, dirNum) : [];
+  if (weekday.length < 5) {
+    return {
+      ok: false,
+      message: "駅探の時刻表から列車ごとの発車時刻を読み取れませんでした",
+    };
+  }
+  let holiday = holidayHtml ? parseEkitanTrains(holidayHtml, dirNum) : [];
+  if (holiday.length < 5) holiday = weekday;
+  const title = weekdayHtml
+    ? (/<title>([^<]+)<\/title>/.exec(weekdayHtml)?.[1] ?? null)
+    : null;
+  const now = new Date();
+  const values = {
+    cacheKey,
+    line,
+    station: stationCore,
+    toward: towardCore,
+    weekdayTrains: JSON.stringify(weekday),
+    holidayTrains: JSON.stringify(holiday),
+    sourceUrl: dir.url,
+    sourceTitle: title,
+    fetchedAt: now,
+  };
+  // Upsert: the board fetches timetables and train details in
+  // parallel, and the same train appears in several stations' lists,
+  // so a plain select-then-insert races itself into a PK conflict.
+  await db
+    .insert(schema.trainTimetableCache)
+    .values(values)
+    .onConflictDoUpdate({
+      target: schema.trainTimetableCache.cacheKey,
+      set: values,
+    });
+  // Keep the minutes-only cache in step with the same fetch.
+  const minuteValues = {
+    line,
+    station: stationCore,
+    toward: towardCore,
+    weekday: JSON.stringify(weekday.map((t) => t.depart)),
+    holiday: JSON.stringify(holiday.map((t) => t.depart)),
+    sourceUrl: dir.url,
+    sourceTitle: title,
+    fetchedAt: now,
+  };
+  const minuteRow = (
+    await db
+      .select()
+      .from(schema.timetableCache)
+      .where(eq(schema.timetableCache.line, line))
+  ).find((r) => r.station === stationCore && r.toward === towardCore);
+  if (minuteRow) {
+    await db
+      .update(schema.timetableCache)
+      .set(minuteValues)
+      .where(eq(schema.timetableCache.id, minuteRow.id));
+  } else {
+    await db.insert(schema.timetableCache).values(minuteValues);
+  }
+  ctx.invalidateQueries();
+  return {
+    ok: true,
+    data: { weekday, holiday, sourceUrl: dir.url, sourceTitle: title },
+  };
+}
+
+/**
+ * One train's stop list (stop pattern + per-station arrival/departure
+ * times) from its ekitan train page, cached in train_detail_cache
+ * (7-day TTL). Returns null when the page cannot be read or parsed —
+ * callers then fall back to the segment's average ride time.
+ */
+async function ensureTrainDetail(
+  ctx: Ctx,
+  line: string,
+  train: TrainDeparture,
+): Promise<{ type: string; dest: string; stops: TrainStopTime[] } | null> {
+  const db = ctx.db<typeof schema>();
+  const trainKey = trainKeyOfHref(train.href);
+  const cached = (
+    await db
+      .select()
+      .from(schema.trainDetailCache)
+      .where(eq(schema.trainDetailCache.trainKey, trainKey))
+  )[0];
+  if (
+    cached &&
+    cached.fetchedAt &&
+    Date.now() - cached.fetchedAt.getTime() < TRAIN_CACHE_TTL_MS
+  ) {
+    const stops = parseTrainStopsJson(cached.stops);
+    if (stops.length >= 2) {
+      return {
+        type: cached.trainType || train.type,
+        dest: cached.dest || train.dest,
+        stops,
+      };
+    }
+  }
+  const html = await fetchPageText(EKITAN_BASE + train.href);
+  if (!html) return null;
+  const stops = parseEkitanTrainStops(html);
+  if (stops.length < 2) return null;
+  const titleInfo = parseEkitanTrainTitle(html);
+  const type = titleInfo.type || train.type;
+  const dest = titleInfo.dest || train.dest;
+  const values = {
+    trainKey,
+    line,
+    trainType: type,
+    dest,
+    stops: JSON.stringify(stops),
+    fetchedAt: new Date(),
+  };
+  // Upsert for the same parallel-fetch reason as the timetable cache.
+  await db
+    .insert(schema.trainDetailCache)
+    .values(values)
+    .onConflictDoUpdate({
+      target: schema.trainDetailCache.trainKey,
+      set: values,
+    });
+  return { type, dest, stops };
+}
 
 export const Actions = {
 getState: defineAction({
@@ -2799,6 +3356,125 @@ await db
 .where(eq(schema.timetableCache.line, args.line))
 ).find((r) => r.station === stationCore && r.toward === towardCore);
 return { ok: true, message: null, timetable: toShape(saved) };
+},
+}),
+
+fetchTrainTimetable: defineAction({
+description:
+"Fetches the per-train timetable for one rail ride segment (line + boarding station + direction toward the alighting station) from the ekitan station timetable: every departure with its train type (普通/快速/特急…), destination and a link to the train's own page. Cached in train_timetable_cache for 7 days; the minutes-only timetable cache is refreshed from the same fetch. Rail only — bus (GTFS) and user-registered timetables have no per-train source and return ok:false so the client keeps the minutes-only model for those segments.",
+request: z.object({
+line: z.string().min(1).max(80),
+station: z.string().min(1).max(80),
+toward: z.string().min(1).max(80),
+}),
+response: z.object({
+ok: z.boolean(),
+message: z.string().nullable(),
+weekday: z.array(
+z.object({
+depart: z.number(),
+type: z.string(),
+dest: z.string(),
+href: z.string(),
+}),
+),
+holiday: z.array(
+z.object({
+depart: z.number(),
+type: z.string(),
+dest: z.string(),
+href: z.string(),
+}),
+),
+sourceUrl: z.string().nullable(),
+sourceTitle: z.string().nullable(),
+}),
+async handler(ctx, args) {
+const res = await ensureTrainTimetable(
+ctx,
+args.line,
+args.station,
+args.toward,
+);
+if (!res.ok) {
+return {
+ok: false,
+message: res.message,
+weekday: [],
+holiday: [],
+sourceUrl: null,
+sourceTitle: null,
+};
+}
+return {
+ok: true,
+message: null,
+weekday: res.data.weekday,
+holiday: res.data.holiday,
+sourceUrl: res.data.sourceUrl,
+sourceTitle: res.data.sourceTitle,
+};
+},
+}),
+
+fetchTrainDetails: defineAction({
+description:
+"Returns the stop pattern of specific trains of one ride segment: for each requested departure minute (of the given day type) at the boarding station, the train's type/destination and its stopping stations with per-station arrival/departure minutes, parsed from the train's own ekitan page and cached in train_detail_cache (7-day TTL). Used to compute real arrival times at the alighting station and mid-segment transfers (local → faster train). Departures whose train page cannot be read are omitted, never fabricated.",
+request: z.object({
+line: z.string().min(1).max(80),
+station: z.string().min(1).max(80),
+toward: z.string().min(1).max(80),
+dayType: z.enum(["weekday", "holiday"]),
+departs: z.array(z.number().int().min(0).max(1560)).max(10),
+}),
+response: z.object({
+ok: z.boolean(),
+message: z.string().nullable(),
+details: z.array(
+z.object({
+depart: z.number(),
+type: z.string(),
+dest: z.string(),
+stops: z.array(
+z.object({
+station: z.string(),
+arrive: z.number().nullable(),
+depart: z.number().nullable(),
+}),
+),
+}),
+),
+}),
+async handler(ctx, args) {
+const tt = await ensureTrainTimetable(
+ctx,
+args.line,
+args.station,
+args.toward,
+);
+if (!tt.ok) {
+return { ok: false, message: tt.message, details: [] };
+}
+const list = args.dayType === "weekday" ? tt.data.weekday : tt.data.holiday;
+const details: {
+depart: number;
+type: string;
+dest: string;
+stops: TrainStopTime[];
+}[] = [];
+for (const dep of [...new Set(args.departs)].slice(0, 10)) {
+const train = list.find((t) => t.depart === dep);
+if (!train) continue;
+const detail = await ensureTrainDetail(ctx, args.line, train);
+if (!detail) continue;
+details.push({
+depart: dep,
+type: detail.type,
+dest: detail.dest,
+stops: detail.stops,
+});
+}
+return { ok: true, message: null, details };
 },
 }),
 
