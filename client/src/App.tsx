@@ -1386,11 +1386,12 @@ function BoardView({
             {/* 行程の内訳 */}
             <ol className="mt-3 space-y-2">
               {shownPlan.legs.map((leg, i) => {
-                // Platform wait comes from predict.ts (leg.waitMin),
-                // which already excludes the walk minutes and the
-                // access minutes between the two rides. Recomputing
-                // it here from depart − previous arrival alone would
-                // count the transfer walk as waiting a second time.
+                // The wait comes from predict.ts (leg.waitMin):
+                // departure − arrival at this station, i.e. the
+                // previous ride's arrival plus the walk between the
+                // two rides. The walk is excluded (it is its own
+                // leg); the in-station access minutes stay inside
+                // the figure, matching how the rider counts it.
                 const waitMin = leg.kind === "ride" ? leg.waitMin : null;
                 return (
                   <li key={`${leg.segmentId}-${i}`} className="flex items-start gap-2.5 text-sm">
@@ -1545,7 +1546,7 @@ function BoardView({
             乗り換えの選択（{stationLabel(firstRideSeg.station ?? firstRideSeg.fromLabel)}から乗れる電車）
           </h2>
           <p className="mt-1 text-xs leading-relaxed text-[var(--dim)]">
-            いまから乗り継げる電車ごとに、途中の駅で速い電車（特急・快速など）に「乗り換える」か、そのまま「乗り換えない」かを切り替えて、その先の駅で乗れる電車と最終到着がどう変わるか比べられます。出発を1本遅らせた場合も同じ見方です。各タブには最終到着を表示しています。「待ち」は徒歩と駅構内の移動を除いた、ホームで待つ時間だけです（徒歩は連鎖の中に別に表示されます）。
+            いまから乗り継げる電車ごとに、途中の駅で速い電車（特急・快速など）に「乗り換える」か、そのまま「乗り換えない」かを切り替えて、その先の駅で乗れる電車と最終到着がどう変わるか比べられます。出発を1本遅らせた場合も同じ見方です。各タブには最終到着を表示しています。「待ち」は、徒歩を終えてその駅に着いた時刻から電車が発車するまでの時間です（徒歩自体は連鎖の中に別に表示されます）。
           </p>
           {(() => {
             const groups: {
@@ -1906,7 +1907,7 @@ function BoardView({
             シナリオ比較（今からこの経路を辿ったら）
           </h2>
           <p className="mt-1 text-xs leading-relaxed text-[var(--dim)]">
-            各駅で最初に乗れる電車に乗り継ぐ「最短」と、どこか1か所で1本見送る場合を、最後の到着まで計算し直した比較です。途中で早く着いても最後の乗り換えで長く待つかどうかが、ここで見分けられます。「待ち」は徒歩と駅構内の移動を除いた、ホームで待つ時間だけです。
+            各駅で最初に乗れる電車に乗り継ぐ「最短」と、どこか1か所で1本見送る場合を、最後の到着まで計算し直した比較です。途中で早く着いても最後の乗り換えで長く待つかどうかが、ここで見分けられます。「待ち」は、徒歩を終えてその駅に着いた時刻から発車までの時間です。
           </p>
           <div className="mt-2 space-y-2">
             {scenarios.map((s) => {

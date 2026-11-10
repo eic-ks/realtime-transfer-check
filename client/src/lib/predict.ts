@@ -271,13 +271,18 @@ export interface LegPlan {
   arrive: number | null; // effective arrival at alighting station
   delayMin: number;
   suspended: boolean;
-  /** Platform wait before this ride: depart − previous ride's
-   * arrival − the walk minutes between the two rides − this
-   * segment's access minutes. The walk and the station access are
-   * travel time, NOT waiting: counting them here as well would
-   * double-count them (they already appear as their own legs /
-   * in the chain's earliest-catchable computation). Null for walks
-   * and the first ride. */
+  /** Wait before this ride, measured the way the rider counts it:
+   * the train's departure minus the moment they reach THIS
+   * station — the previous ride's arrival plus the walk minutes
+   * between the two rides (e.g. arrive 8:42, walk 10 min, reach
+   * the station 8:52, train at 8:56 → wait 4 min). The walk itself
+   * is shown as its own leg, so it is subtracted here. The
+   * in-station access minutes are NOT subtracted: they are part
+   * of the time between reaching the station and the train
+   * leaving. Access still gates which train is catchable (the
+   * pick requires departure ≥ arrival + walk + access), it just
+   * isn't carved out of the displayed wait. Null for walks and
+   * the first ride. */
   waitMin: number | null;
   /** Train type of the ridden train (特急/快速/普通…), when per-train
    * data is available for this segment. */
@@ -309,9 +314,10 @@ export interface PlanOption {
   /** Minutes from the start point to the first platform (walks + access). */
   toPlatformMin: number;
   nextDay: boolean;
-  /** Sum of platform waits between rides (the walk minutes and
-   * access minutes between rides are travel time, not waiting,
-   * and are excluded — see LegPlan.waitMin). */
+  /** Sum of the waits between rides, each measured as departure
+   * minus arrival at that station after the walk (see
+   * LegPlan.waitMin). The walk minutes between rides are travel
+   * time, not waiting, and are excluded. */
   totalWaitMin: number;
 }
 
@@ -560,10 +566,15 @@ export function computePlans(
     let rideCount = 0;
     let prevRideArrive: number | null = null;
     // Walk minutes accumulated since the previous ride's arrival.
-    // They are part of the transfer MOVEMENT, so the platform wait
-    // of the next ride must subtract them (in addition to that
-    // ride's access minutes) — otherwise the same walking minutes
-    // are counted twice: once as the walk leg, once as "waiting".
+    // They are part of the transfer MOVEMENT, so the wait of the
+    // next ride must subtract them — otherwise the same walking
+    // minutes are counted twice: once as the walk leg, once as
+    // "waiting". The ride's access minutes are deliberately NOT
+    // subtracted: the wait is departure − arrival at the station
+    // (after the walk), so the in-station movement sits inside
+    // the wait figure. Access is still added when picking the
+    // earliest catchable train below, so no uncatchable train is
+    // ever selected.
     let walkSincePrevRide = 0;
     let totalWaitMin = 0;
     for (let i = firstRideIdx; i < segs.length; i++) {
@@ -602,12 +613,7 @@ export function computePlans(
         rideCount > 0 && prevRideArrive != null
           ? Math.max(
               0,
-              Math.round(
-                departAbs -
-                  prevRideArrive -
-                  walkSincePrevRide -
-                  (seg.accessMin ?? 0),
-              ),
+              Math.round(departAbs - prevRideArrive - walkSincePrevRide),
             )
           : null;
       if (waitMin != null) totalWaitMin += waitMin;
