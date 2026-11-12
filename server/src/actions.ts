@@ -23,6 +23,7 @@ const segmentShape = z.object({
 id: z.number(),
 position: z.number(),
 type: z.enum(["origin", "walk", "ride"]),
+vehicle: z.enum(["train", "bus"]).nullable(),
 fromLabel: z.string(),
 toLabel: z.string(),
 station: z.string().nullable(),
@@ -70,6 +71,7 @@ station: z.string(),
 toward: z.string(),
 weekday: z.array(z.number()),
 holiday: z.array(z.number()),
+rideMin: z.number().nullable(),
 sourceUrl: z.string().nullable(),
 sourceTitle: z.string().nullable(),
 fetchedAt: z.string().nullable(),
@@ -97,6 +99,7 @@ type StateResponse = z.infer<typeof stateResponse>;
 
 const segmentInput = z.object({
 type: z.enum(["origin", "walk", "ride"]),
+vehicle: z.enum(["train", "bus"]).nullable(),
 fromLabel: z.string().max(80),
 toLabel: z.string().max(80),
 station: z.string().max(80).nullable(),
@@ -224,6 +227,7 @@ return {
 id: s.id,
 position: s.position,
 type: s.type,
+vehicle: s.vehicle ?? null,
 fromLabel: s.fromLabel,
 toLabel: s.toLabel,
 station: s.station,
@@ -274,6 +278,7 @@ station: row.station,
 toward: row.toward,
 weekday: parseMinuteList(row.weekday),
 holiday: parseMinuteList(row.holiday),
+rideMin: row.rideMin,
 sourceUrl: row.sourceUrl,
 sourceTitle: row.sourceTitle,
 fetchedAt: row.fetchedAt ? row.fetchedAt.toISOString() : null,
@@ -1313,6 +1318,11 @@ interface GtfsStop {
   name: string;
   lat: number;
   lng: number;
+  /** Minutes from this direction's first stop on the representative
+   * trip (the diagram trip), from the feed's own stop_times — the
+   * timetable-derived ride time between two stops is the difference
+   * of their offsets. Null on rows cached before offsets existed. */
+  off?: number | null;
 }
 interface GtfsRouteInfo {
   routeId: string;
@@ -1617,10 +1627,17 @@ async function parseGtfsFeed(
     const times = [...(timesByTrip.get(best.tripId) ?? [])].sort(
       (a, b) => a.seq - b.seq,
     );
+    const baseDep = times.find((t) => t.dep != null)?.dep ?? null;
     const stops: GtfsStop[] = [];
     for (const t of times) {
       const stop = stopsById.get(t.stopId);
-      if (stop) stops.push(stop);
+      if (stop) {
+        stops.push({
+          ...stop,
+          off:
+            t.dep != null && baseDep != null ? t.dep - baseDep : null,
+        });
+      }
     }
     if (stops.length < 2) continue;
     directions.push({
@@ -1761,6 +1778,11 @@ async function ensureGtfsFeed(
 ): Promise<{ meta: GtfsFeedMeta; routes: GtfsRouteInfo[] } | null> {
   const db = ctx.db<typeof schema>();
   const feedKey = `${orgId}/${feedId}`;
+  // A fresh cache that only lacks stop offsets is still fully
+  // usable; it is served as a fallback if the one-time re-ingest
+  // (which adds the offsets) fails transiently.
+  let staleFallback: { meta: GtfsFeedMeta; routes: GtfsRouteInfo[] } | null =
+    null;
   const cached = (
     await db
       .select()
@@ -1775,7 +1797,18 @@ async function ensureGtfsFeed(
     try {
       const routes = JSON.parse(cached.routes) as GtfsRouteInfo[];
       if (Array.isArray(routes) && routes.length > 0) {
-        return {
+        // Feeds cached before stop offsets (timetable-derived ride
+        // times) existed are re-ingested once so their line diagrams
+        // gain offsets; after that this check passes from the cache.
+        const lineRows = await db
+          .select()
+          .from(schema.gtfsLineCache)
+          .where(eq(schema.gtfsLineCache.feedKey, feedKey));
+        const lacksOffsets = lineRows.some((r) => {
+          const stops = parseGtfsStopsJson(r.stops);
+          return stops.length >= 2 && stops.some((s, i) => i > 0 && s.off == null);
+        });
+        const cachedResult = {
           meta: {
             feedKey,
             orgId,
@@ -1787,6 +1820,8 @@ async function ensureGtfsFeed(
           },
           routes,
         };
+        if (!lacksOffsets) return cachedResult;
+        staleFallback = cachedResult;
       }
     } catch {
       // fall through and re-ingest
@@ -1798,14 +1833,14 @@ async function ensureGtfsFeed(
     `${GTFS_REPO_API}/organizations/${encodeURIComponent(orgId)}/feeds/${encodeURIComponent(feedId)}/files/feed.zip?rid=current`,
     90000,
   );
-  if (!zip || zip.length > GTFS_MAX_ZIP_BYTES) return null;
+  if (!zip || zip.length > GTFS_MAX_ZIP_BYTES) return staleFallback;
   let parsed: ParsedGtfs | null = null;
   try {
     parsed = await parseGtfsFeed(zip);
   } catch {
     parsed = null;
   }
-  if (!parsed || parsed.routes.length === 0) return null;
+  if (!parsed || parsed.routes.length === 0) return staleFallback;
 
   const orgName = meta.orgName || parsed.agencyName || "";
   const now = new Date();
@@ -1888,7 +1923,12 @@ function parseGtfsStopsJson(raw: string | null): GtfsStop[] {
           typeof (s as GtfsStop).lat === "number" &&
           typeof (s as GtfsStop).lng === "number",
       )
-      .map((s) => ({ name: s.name, lat: s.lat, lng: s.lng }));
+      .map((s) => ({
+        name: s.name,
+        lat: s.lat,
+        lng: s.lng,
+        off: typeof s.off === "number" ? s.off : null,
+      }));
   } catch {
     return [];
   }
@@ -2333,6 +2373,7 @@ await db.insert(schema.segments).values({
 routeId,
 position: i,
 type: seg.type,
+vehicle: seg.type === "ride" ? (seg.vehicle ?? "train") : null,
 fromLabel: seg.fromLabel,
 toLabel: seg.toLabel,
 station: seg.station,
@@ -2901,7 +2942,7 @@ return { lines };
 
 fetchTimetable: defineAction({
 description:
-"Automatically fetches the departure timetable for one ride segment (line + boarding station + direction toward the alighting station). For bus segments whose stops were picked from a GTFS-JP line diagram, the times come from the cached GTFS feed (MLIT GTFS Data Repository). For rail, the primary source is the ekitan (駅探) station timetable for that station/line/direction, parsed deterministically (weekday times from a Tuesday service day, holiday times from a Saturday); if that fails, timetable pages found via web search are extracted with model inference. Results are cached in timetable_cache with the source URL and returned. Departure times are never typed by the user.",
+"Automatically fetches the departure timetable for one ride segment (line + boarding station + direction toward the alighting station). For bus segments whose stops were picked from a GTFS-JP line diagram, the times come from the cached GTFS feed (MLIT GTFS Data Repository). For rail, the primary source is the ekitan (駅探) station timetable for that station/line/direction, parsed deterministically (weekday times from a Tuesday service day, holiday times from a Saturday); if that fails, timetable pages found via web search are extracted with model inference. The typical ride minutes between the two stops are derived from the same timetable data (GTFS stop offsets / an ekitan train page's stop times) and cached alongside. Results are cached in timetable_cache with the source URL and returned. Departure times and ride times are never typed by the user.",
 request: z.object({
 line: z.string().min(1).max(80),
 station: z.string().min(1).max(80),
@@ -2934,6 +2975,7 @@ station: row.station,
 toward: row.toward,
 weekday: parseMinuteList(row.weekday),
 holiday: parseMinuteList(row.holiday),
+rideMin: row.rideMin,
 sourceUrl: row.sourceUrl,
 sourceTitle: row.sourceTitle,
 fetchedAt: row.fetchedAt ? row.fetchedAt.toISOString() : null,
@@ -2950,6 +2992,10 @@ weekday: number[];
 holiday: number[];
 url: string;
 title: string | null;
+/** Typical ride minutes boarding → alighting, derived from the
+ * timetable data itself (GTFS stop offsets / an ekitan train page's
+ * stop times). Ride time is never typed by the user. */
+rideMin: number | null;
 }
 
 // --- bus: GTFS-JP feeds cached from the GTFS Data Repository ---
@@ -2958,6 +3004,7 @@ title: string | null;
 // picked the stops from identifies the feed, route and direction.
 const tryGtfs = async (): Promise<Fetched | null> => {
 try {
+const findDiagram = async () => {
 const rows = await db.select().from(schema.gtfsLineCache);
 let best: (typeof rows)[number] | null = null;
 let bestExact = false;
@@ -2973,7 +3020,35 @@ best = row;
 bestExact = exact;
 }
 }
+return best;
+};
+let best = await findDiagram();
 if (!best) return null;
+// Ride minutes come from the diagram stops' timetable offsets.
+// Diagrams cached before offsets existed carry none — re-ingest
+// the feed once (ensureGtfsFeed detects the missing offsets) and
+// read the diagram again.
+const rideMinOf = (row: (typeof best) & object): number | null => {
+const stops = parseGtfsStopsJson(row.stops);
+const cores = stops.map((s) => coreName(s.name));
+const b = stops[cores.indexOf(stationCore)];
+const a = stops[cores.indexOf(towardCore)];
+if (!b || !a || b.off == null || a.off == null) return null;
+const d = a.off - b.off;
+return d > 0 && d <= 600 ? d : null;
+};
+let rideMin = rideMinOf(best);
+if (rideMin == null) {
+const [orgId = "", feedId = ""] = best.feedKey.split("/");
+if (orgId && feedId) {
+await ensureGtfsFeed(ctx, orgId, feedId);
+const again = await findDiagram();
+if (again) {
+best = again;
+rideMin = rideMinOf(again);
+}
+}
+}
 const dep = (
 await db
 .select()
@@ -2999,6 +3074,7 @@ const provider = feedRow?.orgName || feedRow?.feedName || "GTFSデータ";
 return {
 weekday,
 holiday,
+rideMin,
 url: feedRow?.pageUrl ?? "https://gtfs-data.jp/",
 title: `GTFSデータ（${provider}${feedRow?.feedName ? `・${feedRow.feedName}` : ""}／GTFSデータリポジトリ）`,
 };
@@ -3225,7 +3301,54 @@ if (holiday.length < 5) holiday = weekday;
 const title = weekdayHtml
 ? (/<title>([^<]+)<\/title>/.exec(weekdayHtml)?.[1] ?? null)
 : null;
-return { weekday, holiday, url: dir.url, title };
+// Ride minutes are read off the timetable itself: sample the
+// direction's trains spread across the day (the first trains are
+// almost always locals, so sampling only them would overstate
+// the typical ride), read each sampled train's own stop times
+// (via the shared train-detail cache), and take the median of
+// the scheduled boarding → alighting durations. Trains that
+// never reach the alighting station are skipped; when no train
+// page can be read the ride time stays unknown (null) — it is
+// never guessed.
+let rideMin: number | null = null;
+if (weekdayHtml) {
+const allTrains = parseEkitanTrains(weekdayHtml, dirNum);
+const picks: TrainDeparture[] = [];
+for (const frac of [0, 0.3, 0.55, 0.8]) {
+const t = allTrains[Math.floor(frac * Math.max(0, allTrains.length - 1))];
+if (t && !picks.some((p) => p.href === t.href)) picks.push(t);
+}
+const durations: number[] = [];
+for (const t of picks) {
+const detail = await ensureTrainDetail(ctx, args.line, t);
+if (!detail) continue;
+const stops = detail.stops;
+const bi = stops.findIndex((s) =>
+stationNameVariants(args.station).some((v) =>
+stationCoreLooseEq(s.station, v),
+),
+);
+if (bi < 0) continue;
+const ai = stops.findIndex(
+(s, i) =>
+i > bi && stationCoreLooseEq(s.station, towardCore),
+);
+const bStop = stops[bi];
+const aStop = ai >= 0 ? stops[ai] : undefined;
+if (!bStop || !aStop) continue;
+const depB = bStop.depart ?? bStop.arrive;
+const arrA = aStop.arrive ?? aStop.depart;
+if (depB == null || arrA == null) continue;
+let d = arrA - depB;
+if (d < 0) d += 1440;
+if (d > 0 && d <= 600) durations.push(d);
+}
+if (durations.length > 0) {
+durations.sort((a, b) => a - b);
+rideMin = durations[Math.floor(durations.length / 2)] ?? null;
+}
+}
+return { weekday, holiday, rideMin, url: dir.url, title };
 };
 
 // --- fallback: web-search a timetable page + inference extraction ---
@@ -3300,6 +3423,7 @@ return null;
 return {
 weekday: extracted.weekday,
 holiday: extracted.holiday,
+rideMin: null,
 url: pageUrl,
 title: pageTitle,
 };
@@ -3321,6 +3445,23 @@ fetched = ek;
 }
 if (!fetched) fetched = await tryGeneric();
 if (!fetched) {
+// When the line is unknown to the railway station database AND
+// no GTFS diagram matched, the honest reason is coverage, not a
+// parse hiccup: the operator publishes no usable GTFS / is not
+// on ekitan (e.g. 大阪の南海バス). Say so, so the board can show
+// why this segment cannot be auto-fetched instead of a generic
+// failure.
+let railKnown = true;
+try {
+railKnown = (await heartRailsLineStations(args.line)).length > 0;
+} catch {
+railKnown = true;
+}
+if (!railKnown) {
+return fail(
+`「${args.line}」は駅探・鉄道駅データにもGTFSデータリポジトリにも見つかりませんでした。GTFSデータを公開していない事業者（例：大阪の南海バス）の路線は、時刻表の自動取得の対象外です`,
+);
+}
 return fail(
 ekitanError ||
 "時刻表ページから発車時刻を読み取れませんでした（方面や駅が一致しない可能性があります）",
@@ -3336,6 +3477,7 @@ station: stationCore,
 toward: towardCore,
 weekday: JSON.stringify(weekday),
 holiday: JSON.stringify(holiday),
+rideMin: fetched.rideMin,
 sourceUrl: fetched.url,
 sourceTitle: fetched.title,
 fetchedAt: now,
@@ -3343,7 +3485,12 @@ fetchedAt: now,
 if (cachedRow) {
 await db
 .update(schema.timetableCache)
-.set(values)
+.set({
+...values,
+// A refetch that could not re-derive the ride time keeps the
+// previously derived one instead of erasing it.
+rideMin: fetched.rideMin ?? cachedRow.rideMin,
+})
 .where(eq(schema.timetableCache.id, cachedRow.id));
 } else {
 await db.insert(schema.timetableCache).values(values);
@@ -3480,7 +3627,7 @@ return { ok: true, message: null, details };
 
 searchBusFeeds: defineAction({
 description:
-"Finds bus GTFS-JP feeds published in the MLIT GTFS Data Repository (no API key): feeds serving the area around a point (the repository's extent search) and/or feeds whose operator or feed name matches a query. Returns feed identifiers plus the operator/feed names and license for attribution.",
+"Finds bus GTFS-JP feeds published in the MLIT GTFS Data Repository (no API key): feeds serving the area around a point (the repository's extent search) and/or feeds whose operator or feed name matches a query (substring match, then an in-order subsequence match so e.g. 南海バス also finds 南海りんかんバス）. Note the repository does not carry every operator — 南海バス (Osaka) itself is not published there. Returns feed identifiers plus the operator/feed names and license for attribution.",
 request: z.object({
 query: z.string().max(60),
 lat: z.number().min(-90).max(90).nullable(),
@@ -3496,6 +3643,11 @@ feedName: z.string(),
 license: z.string().nullable(),
 }),
 ),
+/** False when a name query produced only near (group / related)
+ * operator matches and no operator whose name actually contains
+ * the query — the picker then explains that the queried operator
+ * itself may simply not be published in the repository. */
+queryMatched: z.boolean(),
 }),
 async handler(_ctx, args) {
 type Hit = {
@@ -3540,17 +3692,66 @@ for (const f of j.body ?? []) add(f);
 }
 // Feeds whose operator / feed name matches the query text.
 const q = args.query.trim();
+let queryMatched = true;
 if (q) {
+queryMatched = false;
 const catalog = await repoCatalog();
 const qCore = coreName(q);
+// Two match tiers: an exact substring hit first, then a
+// subsequence hit — the query's characters appearing in order
+// with other characters in between. The subsequence tier is what
+// finds 南海りんかんバス for the query 南海バス (the operator's
+// name has りんかん between 南海 and バス, so a plain substring
+// search — and the repository's prefix-only org search — both
+// miss it, which is exactly how "南海バスが出てこない" happened).
+const isSubsequence = (needle: string, hay: string): boolean => {
+const chars = [...needle];
+let i = 0;
+for (const ch of hay) {
+if (ch === chars[i]) i++;
+if (i >= chars.length) return true;
+}
+return false;
+};
+const exact: RepoFeedEntry[] = [];
+const fuzzy: RepoFeedEntry[] = [];
 for (const f of catalog) {
-if (
-coreName(f.organization_name ?? "").includes(qCore) ||
-coreName(f.feed_name ?? "").includes(qCore)
+const orgCore = coreName(f.organization_name ?? "");
+const feedCore = coreName(f.feed_name ?? "");
+if (orgCore.includes(qCore) || feedCore.includes(qCore)) {
+exact.push(f);
+} else if (
+qCore.length >= 3 &&
+// Anchor: the query's first two characters must appear
+// contiguously, so an accidental character sequence like
+// 南…海…バス inside 南知多町海っ子バス (a different operator
+// in Aichi) does not count as a 南海バス match.
+((orgCore.includes(qCore.slice(0, 2)) &&
+isSubsequence(qCore, orgCore)) ||
+(feedCore.includes(qCore.slice(0, 2)) &&
+isSubsequence(qCore, feedCore)))
 ) {
-add(f);
+fuzzy.push(f);
 }
 }
+for (const f of exact) add(f);
+for (const f of fuzzy) add(f);
+// "The operator itself" matched only when an operator name (minus
+// its corporate suffix) or a feed name equals / starts with the
+// query. A different company whose name merely CONTAINS the query
+// (熊野御坊南海バス for 南海バス) does not count — that is exactly
+// the case where the picker must explain that the queried
+// operator itself may not be published in the repository.
+const opCore = (s: string) =>
+coreName(s).replace(/(株式会社|有限会社|合同会社)$/u, "");
+queryMatched = catalog.some((f) => {
+const o = opCore(f.organization_name ?? "");
+const fd = coreName(f.feed_name ?? "");
+return (
+(o !== "" && (o === qCore || o.startsWith(qCore))) ||
+(fd !== "" && (fd === qCore || fd.startsWith(qCore)))
+);
+});
 try {
 const j = (await fetchJson(
 `${GTFS_REPO_API}/feeds?org_name=${encodeURIComponent(q)}`,
@@ -3561,7 +3762,7 @@ for (const f of j.body ?? []) add(f);
 // catalog matches above are enough
 }
 }
-return { feeds: [...out.values()].slice(0, 12) };
+return { feeds: [...out.values()].slice(0, 12), queryMatched };
 },
 }),
 

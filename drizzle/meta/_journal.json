@@ -43,6 +43,20 @@
       "when": 1794311211963,
       "tag": "0006_add_train_timetable_tables",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1794357509385,
+      "tag": "0007_add_vehicle_to_segments",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1794382420804,
+      "tag": "0008_add_ride_min_to_timetable_cache",
+      "breakpoints": true
     }
   ]
 }

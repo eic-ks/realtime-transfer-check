@@ -1,12 +1,14 @@
 // Line-diagram station picker for ride segments.
 //
 // The alighting station of a train/bus ride is always one of the stops
-// on the same line, so it is never chosen from general place search:
-// the line's stations come from the HeartRails station database in
-// travel order (the line diagram), grouped by direction (toward either
-// terminal), and only stations reachable from the boarding station in
-// the chosen direction are offered. Lines the database does not know
-// (most bus routes) fall back to the caller's general place picker.
+// on the same line, so it is never chosen from general place search.
+// The segment's vehicle decides which diagram is used: train segments
+// get the rail diagram (the line's stations from the HeartRails
+// station database in travel order, grouped by direction toward either
+// terminal, only stations reachable from the boarding station
+// offered); bus segments go straight to the GTFS bus diagram below
+// and never touch the rail database. Lines the relevant diagram does
+// not cover fall back to the caller's general place picker.
 
 import { useEffect, useState, type ReactNode } from "react";
 import { api } from "../api";
@@ -26,6 +28,7 @@ const inputCls =
 const labelCls = "block text-xs font-bold text-[var(--dim)] mb-1";
 
 export function LineStationPicker({
+  vehicle,
   line,
   onLineChange,
   boarding,
@@ -33,6 +36,9 @@ export function LineStationPicker({
   onChange,
   fallback,
 }: {
+  /** Bus segments skip the rail diagram entirely: their stops come
+   * from the GTFS bus diagram (or the caller's place search). */
+  vehicle: "train" | "bus";
   line: string;
   onLineChange: (line: string) => void;
   boarding: PlaceValue;
@@ -50,8 +56,9 @@ export function LineStationPicker({
   const boardingName = boarding.name.trim();
 
   // Lines serving the (chained) boarding station: one-tap line choice.
+  // Rail only — the station database has no bus lines.
   useEffect(() => {
-    if (!boardingName) {
+    if (vehicle === "bus" || !boardingName) {
       setLinesForStation([]);
       return;
     }
@@ -67,12 +74,14 @@ export function LineStationPicker({
     return () => {
       cancelled = true;
     };
-  }, [boardingName]);
+  }, [boardingName, vehicle]);
 
-  // The line diagram itself.
+  // The line diagram itself. Rail only: bus lines are not in the
+  // station database, and a GTFS route name must never be looked up
+  // there (it could collide with an unrelated rail line name).
   useEffect(() => {
     const l = line.trim();
-    if (!l) {
+    if (vehicle === "bus" || !l) {
       setStations(null);
       setFound(null);
       return;
@@ -97,7 +106,7 @@ export function LineStationPicker({
     return () => {
       cancelled = true;
     };
-  }, [line]);
+  }, [line, vehicle]);
 
   const boardingIdx =
     stations?.findIndex((s) => stationCore(s.name) === stationCore(boardingName)) ??
@@ -144,7 +153,7 @@ export function LineStationPicker({
           className={inputCls}
           value={line}
           onChange={(e) => onLineChange(e.target.value)}
-          placeholder="例: 京阪本線"
+          placeholder={vehicle === "bus" ? "例: さくらやまなみバス" : "例: 京阪本線"}
         />
       </label>
       {linesForStation.length > 0 && (
@@ -172,6 +181,23 @@ export function LineStationPicker({
         </div>
       )}
 
+      {vehicle === "bus" ? (
+        <div>
+          <span className={labelCls}>降車バス停（路線図から選択）</span>
+          <p className="text-xs text-[var(--dim)]">
+            バスの路線図（停留所一覧）は、GTFSデータリポジトリ（国土交通省）に収録された事業者から選べます。事業者と路線を選ぶと、路線名も自動で入ります。収録されていない事業者は、下の検索で降車バス停を登録してください。
+          </p>
+          <div className="mt-2">
+            <BusGtfsPicker
+              boarding={boarding}
+              value={value}
+              onChange={onChange}
+              onLineChange={onLineChange}
+            />
+          </div>
+          <div className="mt-3">{fallback}</div>
+        </div>
+      ) : (
       <div>
         <span className={labelCls}>降車駅（路線図から選択）</span>
         {!line.trim() && (
@@ -312,6 +338,7 @@ export function LineStationPicker({
           </div>
         )}
       </div>
+      )}
     </div>
   );
 }
@@ -369,6 +396,8 @@ function BusGtfsPicker({
   onLineChange: (line: string) => void;
 }) {
   const [query, setQuery] = useState("");
+  const [searchedQuery, setSearchedQuery] = useState("");
+  const [queryMatched, setQueryMatched] = useState(true);
   const [feeds, setFeeds] = useState<BusFeedHit[] | null>(null);
   const [feedState, setFeedState] = useState<"idle" | "loading" | "done" | "error">("idle");
   const [feed, setFeed] = useState<BusFeedHit | null>(null);
@@ -384,11 +413,13 @@ function BusGtfsPicker({
   const boardingLng = boarding.lng;
 
   const runSearch = (q: string) => {
+    setSearchedQuery(q);
     setFeedState("loading");
     void api
       .searchBusFeeds({ query: q, lat: boardingLat, lng: boardingLng })
       .then((res) => {
         setFeeds(res.feeds);
+        setQueryMatched(res.queryMatched);
         setFeedState("done");
       })
       .catch(() => setFeedState("error"));
@@ -495,7 +526,14 @@ function BusGtfsPicker({
       )}
       {feedState === "done" && feeds && feeds.length === 0 && (
         <p className="mt-2 text-xs text-[var(--dim)]">
-          近くにGTFS収録のバス路線は見つかりませんでした。事業者名で検索するか、下の検索から降車バス停を登録してください。
+          {searchedQuery
+            ? `「${searchedQuery}」に一致するバス事業者はGTFSデータリポジトリに見つかりませんでした。事業者によってはリポジトリ自体に収録されていません（例：大阪の南海バス）。その場合は下の検索から降車バス停を登録してください（時刻表の自動取得は対象外です）。`
+            : "近くにGTFS収録のバス路線は見つかりませんでした。事業者名で検索するか、下の検索から降車バス停を登録してください。"}
+        </p>
+      )}
+      {feedState === "done" && searchedQuery && feeds && feeds.length > 0 && !queryMatched && (
+        <p className="mt-2 text-xs text-[var(--warn)]">
+          「{searchedQuery}」という事業者そのものはGTFSデータリポジトリに見つかりませんでした（この事業者はGTFSデータを公開していない可能性があります）。下に表示されているのは、名前の近い・同じグループの事業者です。
         </p>
       )}
       {feeds && feeds.length > 0 && (

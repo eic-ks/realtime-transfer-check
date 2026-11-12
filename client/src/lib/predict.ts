@@ -8,13 +8,28 @@ export interface SegmentLike {
   id: number;
   position: number;
   type: "origin" | "walk" | "ride";
+  /** Ride segments only: "bus" marks a bus ride (displayed with a bus
+   * icon / バス label and picked from bus-stop diagrams); null or
+   * "train" is a railway ride. Prediction math is identical. */
+  vehicle: "train" | "bus" | null;
   fromLabel: string;
   toLabel: string;
   station: string | null;
   line: string | null;
   baseWalkMin: number | null;
+  /** Optional in-station access / transfer minutes. Null (the
+   * default) means none — the user only sets this on segments
+   * where entering the station or changing trains really takes
+   * time. It gates catchability only, never the displayed wait. */
   accessMin: number | null;
+  /** Legacy ride minutes typed at registration on old routes.
+   * Ride time is now derived from the timetable (autoRideMin);
+   * this is only the fallback when no derivation is available. */
   rideMin: number | null;
+  /** Ride minutes derived from timetable data (the fetched
+   * timetable's ride_min, or the median scheduled duration of the
+   * segment's own trains). Wins over the legacy rideMin. */
+  autoRideMin?: number | null;
   departuresWeekday: number[];
   departuresHoliday: number[];
   lat: number | null;
@@ -43,12 +58,25 @@ export interface RouteLike {
   segments: SegmentLike[];
 }
 
+/** True when a ride segment is a bus ride rather than a train ride. */
+export function isBusSegment(seg: SegmentLike): boolean {
+  return seg.type === "ride" && seg.vehicle === "bus";
+}
+
 export interface TimetableLike {
   line: string;
   station: string;
   toward: string;
   weekday: number[];
   holiday: number[];
+  /** Ride minutes derived from the timetable source, when known. */
+  rideMin?: number | null;
+}
+
+/** Effective ride minutes for a segment: the timetable-derived
+ * value wins; a legacy user-typed value is only a fallback. */
+export function rideMinutesOf(seg: SegmentLike): number {
+  return seg.autoRideMin ?? seg.rideMin ?? 0;
 }
 
 /** One scheduled train of a ride segment, from the per-train
@@ -133,6 +161,9 @@ export function applyTimetables(
       ...seg,
       departuresWeekday: tt.weekday,
       departuresHoliday: tt.holiday.length > 0 ? tt.holiday : tt.weekday,
+      // The timetable fetch also derived the ride time between the
+      // two stops from the timetable itself — no user input.
+      ...(tt.rideMin != null ? { autoRideMin: tt.rideMin } : {}),
     };
   });
   return changed ? { ...route, segments } : route;
@@ -198,8 +229,8 @@ export function applyTrainData(
     const build = (
       list: { depart: number; type: string; dest: string }[],
       dayType: DayType,
-    ): RideTrain[] =>
-      list.map((t) => {
+    ): RideTrain[] => {
+      const mapped = list.map((t) => {
         const stops = details.get(
           trainDetailKey(seg.line as string, station, seg.toLabel, dayType, t.depart),
         );
@@ -216,6 +247,35 @@ export function applyTrainData(
           servesDest: true,
         };
       });
+      // Ride time comes from the timetable, not from user input:
+      // trains whose own stop list was not fetched get their
+      // arrival estimated from the scheduled durations of this
+      // segment's fetched trains — the median of the same train
+      // type when available, else the median of all of them.
+      const median = (xs: number[]): number | null => {
+        if (xs.length === 0) return null;
+        const sorted = [...xs].sort((a, b) => a - b);
+        return sorted[Math.floor(sorted.length / 2)] ?? null;
+      };
+      const byType = new Map<string, number[]>();
+      const all: number[] = [];
+      for (const t of mapped) {
+        if (t.arriveDest == null) continue;
+        const d = t.arriveDest - t.depart;
+        if (d <= 0) continue;
+        all.push(d);
+        const arr = byType.get(t.type) ?? [];
+        arr.push(d);
+        byType.set(t.type, arr);
+      }
+      const overall = median(all);
+      if (overall == null) return mapped;
+      return mapped.map((t) => {
+        if (t.arriveDest != null || t.servesDest === false) return t;
+        const est = median(byType.get(t.type) ?? []) ?? overall;
+        return { ...t, arriveDest: t.depart + est };
+      });
+    };
     changed = true;
     return {
       ...seg,
@@ -436,7 +496,7 @@ export function computePlans(
     train: RideTrain,
     mode: FirstRideMode,
   ): { arrive: number; transfer: TransferOption | null } => {
-    const direct = train.arriveDest ?? train.depart + (seg.rideMin ?? 0);
+    const direct = train.arriveDest ?? train.depart + rideMinutesOf(seg);
     if (mode === "stay") return { arrive: direct, transfer: null };
     const options = (seg.transferOptions ?? []).filter(
       (o) => o.boardDepart === train.depart,
@@ -494,7 +554,7 @@ export function computePlans(
       if (schedAbs == null) return null;
       return {
         schedAbs,
-        arriveSchedAbs: schedAbs + (seg.rideMin ?? 0),
+        arriveSchedAbs: schedAbs + rideMinutesOf(seg),
         train: null,
         transfer: null,
       };
@@ -784,7 +844,7 @@ export function computeFocusChoices(
     );
     const directArrive =
       trains.find((t) => t.depart === b.depart)?.arriveDest ??
-      b.depart + (firstRide.rideMin ?? 0);
+      b.depart + rideMinutesOf(firstRide);
     const useful = options.filter((o) => o.arriveDest < directArrive);
     const variants: {
       mode: "stay" | "transfer" | "direct";

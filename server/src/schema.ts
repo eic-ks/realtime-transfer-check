@@ -24,6 +24,10 @@ export const segments = sqliteTable("segments", {
   routeId: integer("route_id").notNull(),
   position: integer("position").notNull(),
   type: text("type", { enum: ["origin", "walk", "ride"] }).notNull(),
+  // Ride segments only: whether the vehicle is a train or a bus. The
+  // two used to be indistinguishable (every ride displayed as 電車);
+  // null on rows saved before this column existed means train.
+  vehicle: text("vehicle", { enum: ["train", "bus"] }),
   fromLabel: text("from_label").notNull().default(""),
   toLabel: text("to_label").notNull().default(""),
   station: text("station"),
@@ -90,6 +94,11 @@ export const timetableCache = sqliteTable("timetable_cache", {
   // JSON number[]: departure minutes-of-day.
   weekday: text("weekday"),
   holiday: text("holiday"),
+  // Typical ride minutes between the boarding and alighting stops,
+  // derived from the timetable itself when the fetch runs (ekitan
+  // train pages / GTFS representative trip). Ride time is never typed
+  // by the user; null when the source could not provide it.
+  rideMin: integer("ride_min"),
   sourceUrl: text("source_url"),
   sourceTitle: text("source_title"),
   fetchedAt: integer("fetched_at", { mode: "timestamp_ms" }),

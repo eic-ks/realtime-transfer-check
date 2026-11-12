@@ -29,6 +29,7 @@ type RouteLike,
 } from "../lib/predict";
 import { LineStationPicker } from "./LineStationPicker";
 import {
+BusIcon,
 ChevronDownIcon,
 ChevronUpIcon,
 FlagIcon,
@@ -40,9 +41,17 @@ WalkIcon,
 } from "./icons";
 import { PlacePicker, emptyPlace, type PlaceValue } from "./PlacePicker";
 
+/** The three ways to move between two spots on a route. "train" and
+ * "bus" both produce ride segments; the vehicle only changes how the
+ * segment is displayed and which line diagram the stop is picked
+ * from — the prediction math is the same. */
+export type SegmentKind = "walk" | "train" | "bus";
+
 export interface DraftSegment {
   key: number;
   type: "origin" | "walk" | "ride";
+  /** Ride segments only: train or bus. */
+  vehicle: "train" | "bus";
   fromLabel: string;
   toLabel: string;
   station: string;
@@ -83,17 +92,22 @@ function rechain(list: DraftSegment[]): DraftSegment[] {
 let keyCounter = 1;
 export function newDraftSegment(
   type: "origin" | "walk" | "ride",
+  vehicle: "train" | "bus" = "train",
 ): DraftSegment {
   return {
     key: keyCounter++,
     type,
+    vehicle,
     fromLabel: "",
     toLabel: "",
     station: "",
     line: "",
     baseWalkMin: type === "walk" ? "10" : "",
-    accessMin: type === "ride" ? "3" : "",
-    rideMin: type === "ride" ? "15" : "",
+    // Access (in-station / transfer) minutes are opt-in: blank
+    // means none. Ride minutes are never entered — they are
+    // derived from the timetable when the board fetches it.
+    accessMin: "",
+    rideMin: "",
     timesWeekday: "",
     timesHoliday: "",
     timesReturnWeekday: "",
@@ -107,6 +121,7 @@ export function routeToDraft(route: RouteLike): DraftSegment[] {
   return route.segments.map((s) => ({
     key: keyCounter++,
     type: s.type,
+    vehicle: s.vehicle === "bus" ? ("bus" as const) : ("train" as const),
     fromLabel: s.fromLabel,
     toLabel: s.toLabel,
     station: s.station ?? "",
@@ -153,6 +168,7 @@ export interface RoutePayload {
   bufferMin: number;
   segments: {
     type: "origin" | "walk" | "ride";
+    vehicle: "train" | "bus" | null;
     fromLabel: string;
     toLabel: string;
     station: string | null;
@@ -214,6 +230,7 @@ export function draftToPayload(
       const pf = placeFields(d.place);
       segments.push({
         type: "origin",
+        vehicle: null,
         fromLabel: "",
         toLabel: d.place.name.trim(),
         station: null,
@@ -244,6 +261,7 @@ export function draftToPayload(
       const tf = placeFields(d.toPlace);
       segments.push({
         type: "walk",
+        vehicle: null,
         fromLabel: d.place.name.trim(),
         toLabel: d.toPlace.name.trim(),
         station: null,
@@ -264,7 +282,13 @@ export function draftToPayload(
       });
     } else {
       if (!d.line.trim() || !d.place.name.trim() || !d.toPlace.name.trim()) {
-        return { ok: false, error: `${label}: 路線名・乗車駅・降車駅を入力してください` };
+        return {
+          ok: false,
+          error:
+            d.vehicle === "bus"
+              ? `${label}: 路線名・乗車バス停・降車バス停を入力してください`
+              : `${label}: 路線名・乗車駅・降車駅を入力してください`,
+        };
       }
       // Departure times are NOT entered at registration: they are
       // fetched automatically from the route (line + stations) when
@@ -274,10 +298,11 @@ export function draftToPayload(
       const holiday = d.timesHoliday.trim()
         ? parseTimes(d.timesHoliday)
         : weekday;
+      // Ride minutes are NOT entered either: the board derives
+      // them from the fetched timetable (line diagram / train stop
+      // times). A value stored on an older route is passed through
+      // untouched as a fallback.
       const rideMin = numOrNull(d.rideMin);
-      if (rideMin == null || rideMin <= 0) {
-        return { ok: false, error: `${label}: 乗車時間（分）を入力してください` };
-      }
       const retWeekday = parseTimes(d.timesReturnWeekday);
       const retHoliday = d.timesReturnHoliday.trim()
         ? parseTimes(d.timesReturnHoliday)
@@ -290,13 +315,19 @@ export function draftToPayload(
       const tf = placeFields(d.toPlace);
       segments.push({
         type: "ride",
+        vehicle: d.vehicle,
         fromLabel: d.fromLabel.trim(),
         toLabel: d.toPlace.name.trim(),
         station: d.place.name.trim(),
         line: d.line.trim(),
         baseWalkMin: null,
-        accessMin: Math.max(0, Math.round(numOrNull(d.accessMin) ?? 3)),
-        rideMin: Math.round(rideMin),
+        // Opt-in: blank stays null (no access minutes). Only a
+        // value the user actually typed is stored.
+        accessMin:
+          numOrNull(d.accessMin) != null
+            ? Math.max(0, Math.round(numOrNull(d.accessMin) as number))
+            : null,
+        rideMin: rideMin != null ? Math.round(rideMin) : null,
         departures: { weekday, holiday },
         lat: pf.lat,
         lng: pf.lng,
@@ -381,10 +412,10 @@ function ChainedStart({
 }
 
 // Insert strip on the timeline rail, rendered between two segment cards
-// (or before the start). Tapping the ＋ expands a two-way choice — 徒歩 /
-// 電車 — and the picked segment is inserted at exactly this position;
-// the chain re-links around it, so the following segment now starts at
-// the new spot once the user registers it.
+// (or before the start). Tapping the ＋ expands a three-way choice —
+// 徒歩 / 電車 / バス — and the picked segment is inserted at exactly
+// this position; the chain re-links around it, so the following
+// segment now starts at the new spot once the user registers it.
 function InsertStrip({
   label,
   verb,
@@ -397,7 +428,7 @@ function InsertStrip({
   verb: "入れる" | "つなぐ";
   open: boolean;
   onToggle: () => void;
-  onPick: (type: "walk" | "ride") => void;
+  onPick: (kind: SegmentKind) => void;
 }) {
   if (!open) {
     return (
@@ -445,9 +476,16 @@ function InsertStrip({
         <button
           type="button"
           className="flex items-center gap-1 rounded-full border border-[var(--accent-dim)] bg-[#123c26] px-2.5 py-1.5 text-xs font-black text-[#4ade80]"
-          onClick={() => onPick("ride")}
+          onClick={() => onPick("train")}
         >
           <TrainIcon size={13} /> 電車で{verb}
+        </button>
+        <button
+          type="button"
+          className="flex items-center gap-1 rounded-full border border-[var(--accent-dim)] bg-[#123c26] px-2.5 py-1.5 text-xs font-black text-[#4ade80]"
+          onClick={() => onPick("bus")}
+        >
+          <BusIcon size={13} /> バスで{verb}
         </button>
         <span className="text-xs text-[var(--dim)]">
           {verb === "つなぐ"
@@ -470,7 +508,7 @@ function segmentSummary(d: DraftSegment): string {
   if (d.type === "walk") {
     return `${from} → ${to}${d.baseWalkMin ? ` ・ 約${d.baseWalkMin}分` : ""}`;
   }
-  return `${d.line ? `${d.line} ・ ` : ""}${from} → ${to}${d.rideMin ? ` ・ 乗車約${d.rideMin}分` : ""}`;
+  return `${d.line ? `${d.line} ・ ` : ""}${from} → ${to}`;
 }
 
 interface EditorProps {
@@ -525,8 +563,13 @@ export function RouteEditor({
   const remove = (idx: number) => {
     setDrafts((prev) => rechain(prev.filter((_, i) => i !== idx)));
   };
-  const add = (type: "walk" | "ride") => {
-    const draft = newDraftSegment(type);
+  const draftForKind = (kind: SegmentKind): DraftSegment =>
+    kind === "walk"
+      ? newDraftSegment("walk")
+      : newDraftSegment("ride", kind === "bus" ? "bus" : "train");
+
+  const add = (kind: SegmentKind) => {
+    const draft = draftForKind(kind);
     setHighlightKey(draft.key);
     setDrafts((prev) => {
       const last = prev[prev.length - 1];
@@ -536,7 +579,9 @@ export function RouteEditor({
         const end = endPlaceOf(last);
         draft.place = { ...end };
         draft.fromLabel = end.name;
-        if (type === "ride" && end.line) draft.line = end.line;
+        if (draft.type === "ride" && draft.vehicle === "train" && end.line) {
+          draft.line = end.line;
+        }
       }
       return [...prev, draft];
     });
@@ -547,8 +592,8 @@ export function RouteEditor({
   // segment that used to follow now starts at the NEW segment's end
   // spot, via rechain — so once the user registers the new spot, the
   // rest of the route re-links behind it automatically.
-  const insertAfter = (idx: number, type: "walk" | "ride") => {
-    const draft = newDraftSegment(type);
+  const insertAfter = (idx: number, kind: SegmentKind) => {
+    const draft = draftForKind(kind);
     setHighlightKey(draft.key);
     setDrafts((prev) => {
       const before = prev[idx];
@@ -556,7 +601,9 @@ export function RouteEditor({
         const end = endPlaceOf(before);
         draft.place = { ...end };
         draft.fromLabel = end.name;
-        if (type === "ride" && end.line) draft.line = end.line;
+        if (draft.type === "ride" && draft.vehicle === "train" && end.line) {
+          draft.line = end.line;
+        }
       }
       const next = [
         ...prev.slice(0, idx + 1),
@@ -573,16 +620,16 @@ export function RouteEditor({
   // whose destination is the old start spot. The old origin card goes
   // away — its spot lives on as the connecting segment's end, and the
   // rest of the chain re-links behind it unchanged.
-  const prepend = (type: "walk" | "ride") => {
+  const prepend = (kind: SegmentKind) => {
     const newOrigin = newDraftSegment("origin");
-    const seg = newDraftSegment(type);
+    const seg = draftForKind(kind);
     setHighlightKey(newOrigin.key);
     setDrafts((prev) => {
       const oldOrigin = prev[0];
       if (!oldOrigin) return prev;
       seg.toPlace = { ...oldOrigin.place };
       seg.toLabel = oldOrigin.place.name;
-      if (type === "ride" && oldOrigin.place.line) {
+      if (seg.type === "ride" && seg.vehicle === "train" && oldOrigin.place.line) {
         seg.line = oldOrigin.place.line;
       }
       return rechain([newOrigin, seg, ...prev.slice(1)]);
@@ -730,6 +777,8 @@ export function RouteEditor({
                     <FlagIcon size={15} />
                   ) : d.type === "walk" ? (
                     <WalkIcon size={15} className="text-[var(--warn)]" />
+                  ) : d.vehicle === "bus" ? (
+                    <BusIcon size={15} className="text-[var(--accent)]" />
                   ) : (
                     <TrainIcon size={15} className="text-[var(--accent)]" />
                   )}
@@ -749,7 +798,9 @@ export function RouteEditor({
                       ? "出発地点"
                       : d.type === "walk"
                         ? "徒歩"
-                        : "電車"}
+                        : d.vehicle === "bus"
+                          ? "バス"
+                          : "電車"}
                     {d.key === highlightKey && (
                       <span className="rounded bg-[#123c26] px-1.5 py-0.5 text-[11px] font-bold text-[#4ade80]">
                         追加しました
@@ -832,8 +883,42 @@ export function RouteEditor({
 
                 {d.type === "ride" && (
                   <div className="mt-2 space-y-3">
-                    <ChainedStart label="乗車駅" value={d.place} />
+                    <div>
+                      <span className={labelCls}>乗り物</span>
+                      <div
+                        className="flex rounded-md border border-[var(--border)]"
+                        role="group"
+                        aria-label={`区間${idx + 1}の乗り物の種類`}
+                      >
+                        {(
+                          [
+                            ["train", "電車", TrainIcon],
+                            ["bus", "バス", BusIcon],
+                          ] as const
+                        ).map(([v, label, Icon]) => (
+                          <button
+                            key={v}
+                            type="button"
+                            aria-pressed={d.vehicle === v}
+                            onClick={() => update(d.key, { vehicle: v })}
+                            className={`flex flex-1 items-center justify-center gap-1.5 px-2 py-1.5 text-xs font-bold ${
+                              d.vehicle === v
+                                ? "bg-[var(--surface)] text-[var(--text)]"
+                                : "text-[var(--dim)]"
+                            }`}
+                          >
+                            <Icon size={14} />
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <ChainedStart
+                      label={d.vehicle === "bus" ? "乗車バス停" : "乗車駅"}
+                      value={d.place}
+                    />
                     <LineStationPicker
+                      vehicle={d.vehicle}
                       line={d.line}
                       onLineChange={(line) => update(d.key, { line })}
                       boarding={d.place}
@@ -841,44 +926,39 @@ export function RouteEditor({
                       onChange={(toPlace) => setEndPlace(idx, toPlace)}
                       fallback={
                         <PlacePicker
-                          label="降車駅・バス停"
-                          namePlaceholder="例: 池袋"
+                          label={
+                            d.vehicle === "bus" ? "降車バス停" : "降車駅・バス停"
+                          }
+                          namePlaceholder={
+                            d.vehicle === "bus" ? "例: 四条烏丸" : "例: 池袋"
+                          }
                           value={d.toPlace}
                           onChange={(toPlace) => setEndPlace(idx, toPlace)}
                           near={placeNear(d.place)}
                         />
                       }
                     />
-                    <div className="grid grid-cols-2 gap-2">
-                      <Field label="乗車時間（分）">
-                        <input
-                          aria-label="乗車時間"
-                          className={inputCls}
-                          type="number"
-                          min={1}
-                          max={600}
-                          value={d.rideMin}
-                          onChange={(e) =>
-                            update(d.key, { rideMin: e.target.value })
-                          }
-                        />
-                      </Field>
-                      <Field label="乗換・入場（分）">
-                        <input
-                          aria-label="乗り換え入場分数"
-                          className={inputCls}
-                          type="number"
-                          min={0}
-                          max={60}
-                          value={d.accessMin}
-                          onChange={(e) =>
-                            update(d.key, { accessMin: e.target.value })
-                          }
-                        />
-                      </Field>
-                    </div>
+                    <Field label="乗換・入場（分・任意）">
+                      <input
+                        aria-label="乗り換え入場分数（任意）"
+                        className={inputCls}
+                        type="number"
+                        min={0}
+                        max={60}
+                        placeholder="なし"
+                        value={d.accessMin}
+                        onChange={(e) =>
+                          update(d.key, { accessMin: e.target.value })
+                        }
+                      />
+                    </Field>
                     <p className="text-xs text-[var(--dim)]">
-                      発車時刻は登録不要です。発車案内を開いたときに、路線と乗車駅・降車駅から時刻表を自動で取得して使います。駅・路線・乗車時間は行き・帰り両方向で共通です。路線図から降車駅を選べるのは鉄道の路線と、GTFSデータリポジトリ（国土交通省）に収録されたバス路線です。収録されていないバス路線は、降車バス停を検索で登録してください（その場合、時刻表の自動取得は対象外です）。
+                      乗換・入場は、改札やホームまでの移動に時間がかかる駅だけで入力してください。空欄なら「なし（0分）」で計算します。乗車時間は時刻表（運行図）から自動で求めるので入力は不要です。
+                    </p>
+                    <p className="text-xs text-[var(--dim)]">
+                      {d.vehicle === "bus"
+                        ? "発車時刻は登録不要です。発車案内を開いたときに、路線と乗車バス停・降車バス停から時刻表を自動で取得して使います。停留所・路線は行き・帰り両方向で共通です。路線図（停留所一覧）から降車バス停を選べるのは、GTFSデータリポジトリ（国土交通省）に収録されたバス路線のみです。収録されていないバス路線は、降車バス停を検索で登録してください（その場合、時刻表の自動取得は対象外です）。"
+                        : "発車時刻は登録不要です。発車案内を開いたときに、路線と乗車駅・降車駅から時刻表を自動で取得して使います。駅・路線は行き・帰り両方向で共通です。降車駅は路線図（駅一覧）から選べます。バスに乗る区間は、上の「乗り物」でバスに切り替えてください。"}
                     </p>
                   </div>
                 )}
@@ -901,7 +981,7 @@ export function RouteEditor({
         ))}
       </div>
 
-      <div className="mt-2 flex gap-2 pl-10">
+      <div className="mt-2 flex flex-wrap gap-2 pl-10">
         <button
           type="button"
           className="flex items-center gap-1 rounded-md border border-dashed border-[var(--border)] px-3 py-2 text-sm font-bold"
@@ -912,9 +992,16 @@ export function RouteEditor({
         <button
           type="button"
           className="flex items-center gap-1 rounded-md border border-dashed border-[var(--border)] px-3 py-2 text-sm font-bold"
-          onClick={() => add("ride")}
+          onClick={() => add("train")}
         >
           <PlusIcon size={15} /> 電車区間を最後に追加
+        </button>
+        <button
+          type="button"
+          className="flex items-center gap-1 rounded-md border border-dashed border-[var(--border)] px-3 py-2 text-sm font-bold"
+          onClick={() => add("bus")}
+        >
+          <PlusIcon size={15} /> バス区間を最後に追加
         </button>
       </div>
 

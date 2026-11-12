@@ -13,6 +13,7 @@ effectiveDelayMin,
 fmtCountdown,
 fmtTime,
 haversineM,
+isBusSegment,
 nowJst,
 reversedRoute,
 routePoints,
@@ -37,6 +38,7 @@ type RoutePayload,
 } from "./components/RouteEditor";
 import {
 AlertIcon,
+BusIcon,
 ClockIcon,
 CrosshairIcon,
 PinIcon,
@@ -57,6 +59,11 @@ type View = "board" | "routes" | "learn";
  * 2026-11-10 parser fix (operator line names + per-direction block
  * isolation) and are refetched once when the board opens. */
 const TIMETABLE_FIX_EPOCH_MS = Date.parse("2026-11-10T11:00:00.000Z");
+
+/** Timetable cache rows fetched before this instant predate
+ * timetable-derived ride times (ride_min) and are refetched once
+ * when the board opens so ride times come from the timetable. */
+const RIDE_MIN_EPOCH_MS = Date.parse("2026-11-11T07:30:00.000Z");
 
 /** Station names picked from place search often already end in 駅
  * (なんば駅); append the suffix only when it is missing. */
@@ -548,6 +555,20 @@ function BoardView({
           ) {
             needs = true;
           }
+          // Rows cached before ride times were derived from the
+          // timetable carry no rideMin; refetch them once so the
+          // ride time comes from the timetable. The derived value
+          // wins over any stored ride minutes in prediction —
+          // stored values on old routes are typically the old
+          // editor's untouched defaults, not real ride times.
+          if (
+            row &&
+            row.rideMin == null &&
+            row.fetchedAt != null &&
+            Date.parse(row.fetchedAt) < RIDE_MIN_EPOCH_MS
+          ) {
+            needs = true;
+          }
         }
       }
       if (!needs) continue;
@@ -649,7 +670,9 @@ function BoardView({
   useEffect(() => {
     if (!displayRoute) return;
     for (const seg of displayRoute.segments) {
-      if (seg.type !== "ride" || !seg.line) continue;
+      // Bus segments have no per-train source (ekitan is rail-only);
+      // they stay on the minutes-only model from their GTFS timetable.
+      if (seg.type !== "ride" || !seg.line || isBusSegment(seg)) continue;
       void fetchTrainTT(
         seg.line,
         seg.station ?? seg.fromLabel,
@@ -1028,7 +1051,7 @@ function BoardView({
         <TrainIcon size={40} className="mx-auto text-[var(--dim)]" />
         <p className="mt-4 text-base font-black">まだ経路が登録されていません</p>
         <p className="mx-auto mt-2 max-w-sm text-sm text-[var(--dim)]">
-          いつもの経路（出発地点→徒歩→電車→目的地）を登録すると、発車時刻は経路から自動で取得し、今いる場所と時刻から乗れる電車をリアルタイムで案内します。
+          いつもの経路（出発地点→徒歩→電車・バス→目的地）を登録すると、発車時刻は経路から自動で取得し、今いる場所と時刻から乗れる電車・バスをリアルタイムで案内します。
         </p>
         <button
           type="button"
@@ -1049,6 +1072,18 @@ function BoardView({
         .map((s) => s.line as string),
     ),
   ];
+  // Bus rides get a bus icon / label wherever a ride is displayed;
+  // everything else about them is computed like a train ride.
+  const busSegmentIds = new Set(
+    shownRoute.segments
+      .filter((s) => s.type === "ride" && s.vehicle === "bus")
+      .map((s) => s.id),
+  );
+  const busLines = new Set(
+    shownRoute.segments
+      .filter((s) => s.type === "ride" && s.vehicle === "bus" && s.line)
+      .map((s) => s.line as string),
+  );
   const positions: { idx: number; label: string }[] = [];
   shownRoute.segments.forEach((s, i) => {
     if (s.type === "ride" || i === 0) {
@@ -1261,7 +1296,7 @@ function BoardView({
       >
         {!plan.hasRide && (
           <p className="text-sm text-[var(--dim)]">
-            この経路には電車区間がありません。経路の編集から電車区間を追加してください（発車時刻は自動で取得します）。
+            この経路には電車・バス区間がありません。経路の編集から電車区間・バス区間を追加してください（発車時刻は自動で取得します）。
           </p>
         )}
         {plan.hasRide && plan.firstRideSuspended && (
@@ -1397,6 +1432,8 @@ function BoardView({
                   <li key={`${leg.segmentId}-${i}`} className="flex items-start gap-2.5 text-sm">
                     {leg.kind === "walk" ? (
                       <WalkIcon size={17} className="mt-0.5 shrink-0 text-[var(--warn)]" />
+                    ) : busSegmentIds.has(leg.segmentId) ? (
+                      <BusIcon size={17} className="mt-0.5 shrink-0 text-[var(--accent)]" />
                     ) : (
                       <TrainIcon size={17} className="mt-0.5 shrink-0 text-[var(--accent)]" />
                     )}
@@ -2175,7 +2212,10 @@ function BoardView({
             鉄道については、駅探の列車別ページから列車ごとの種別（普通・快速・特急など）と各駅の到着・発車時刻も取得し、降車駅への実際の到着時刻と、途中の駅で速い電車へ乗り換える選択肢の判定に使っています。バス（GTFS）区間と登録済み時刻表の区間には列車単位のデータがないため、乗り換え判定の対象外です。
           </p>
           <p className="mt-1">
-            京都市バスなど一部の事業者のGTFSデータは公共交通オープンデータセンター（ODPT）でのみ公開されており、利用には無料のアクセストークン（開発者登録）が必要です。このアプリにはトークンが設定されていないため、それらの事業者は路線図・時刻表の自動取得の対象外です。
+            乗車時間は入力不要で、取得した時刻表（列車ごとの停車時刻・GTFSの停留所時刻）から区間ごとに自動で求めています。
+          </p>
+          <p className="mt-1">
+            京都市バスなど一部の事業者のGTFSデータは公共交通オープンデータセンター（ODPT）でのみ公開されており、利用には無料のアクセストークン（開発者登録）が必要です。このアプリにはトークンが設定されていないため、それらの事業者は路線図・時刻表の自動取得の対象外です。また大阪の南海バスのように、GTFSデータリポジトリにもODPTにも公開されていない事業者は自動取得の対象外です（南海りんかんバスなど、リポジトリに収録された南海グループの事業者は対象です）。
           </p>
         </div>
       </section>
@@ -2188,6 +2228,7 @@ function BoardView({
             <LineStatusCard
               key={line}
               line={line}
+              bus={busLines.has(line)}
               status={statuses.get(line)}
               refreshing={refreshingLine === line}
               note={refreshNote?.line === line ? refreshNote : null}
@@ -2196,7 +2237,7 @@ function BoardView({
             />
           ))}
           {lines.length === 0 && (
-            <p className="text-sm text-[var(--dim)]">電車区間がありません。</p>
+            <p className="text-sm text-[var(--dim)]">電車・バス区間がありません。</p>
           )}
         </div>
       </section>
@@ -2206,6 +2247,7 @@ function BoardView({
 
 function LineStatusCard({
   line,
+  bus,
   status,
   refreshing,
   note,
@@ -2213,6 +2255,8 @@ function LineStatusCard({
   onManualDelay,
 }: {
   line: string;
+  /** True when this line belongs to a bus segment (icon only). */
+  bus: boolean;
   status: LineStatusRow | undefined;
   refreshing: boolean;
   note: { ok: boolean; message: string } | null;
@@ -2226,7 +2270,11 @@ function LineStatusCard({
     <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-3">
       <div className="flex items-center justify-between gap-2">
         <p className="flex items-center gap-2 text-sm font-black">
-          <TrainIcon size={16} className="text-[var(--accent)]" />
+          {bus ? (
+            <BusIcon size={16} className="text-[var(--accent)]" />
+          ) : (
+            <TrainIcon size={16} className="text-[var(--accent)]" />
+          )}
           {line}
           <span className={`rounded px-1.5 py-0.5 text-xs font-bold ${meta.cls}`}>
             {status?.status === "delayed" && effective > 0

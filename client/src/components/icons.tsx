@@ -31,6 +31,19 @@ export function TrainIcon({ size = 18, className }: IconProps) {
   );
 }
 
+export function BusIcon({ size = 18, className }: IconProps) {
+  return (
+    <svg {...base(size)} className={className}>
+      <rect x="4" y="3" width="16" height="14" rx="2.5" />
+      <path d="M4 10h16" />
+      <path d="M12 3v7" />
+      <circle cx="8" cy="14" r="0.5" fill="currentColor" />
+      <circle cx="16" cy="14" r="0.5" fill="currentColor" />
+      <path d="M7 21l1-4M17 21l-1-4" />
+    </svg>
+  );
+}
+
 export function WalkIcon({ size = 18, className }: IconProps) {
   return (
     <svg {...base(size)} className={className}>
